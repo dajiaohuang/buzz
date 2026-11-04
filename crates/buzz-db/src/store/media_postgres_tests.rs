@@ -170,6 +170,10 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
         "purge must not resurrect uploader preview"
     );
     // Profiles predate recording and therefore need no grant backfill.
+    sqlx::query(r#"INSERT INTO events(community_id,id,pubkey,created_at,kind,tags,content,sig)
+        SELECT $1,decode(md5(g::text)||md5(g::text),'hex'),decode(md5(g::text)||md5(g::text),'hex'),now(),0,'[]',
+        '{"name":"\u00e9"}',decode(repeat('a',128),'hex') FROM generate_series(1,1100) g"#)
+        .bind(community.as_uuid()).execute(db.pool()).await.unwrap();
     let profile = EventBuilder::new(
         Kind::Metadata,
         serde_json::json!({"picture":format!("{base}/{a}.bin")}).to_string(),
@@ -181,6 +185,12 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
         allowed(&db, community, &a, &base, &outsider).await,
         MediaAccess::Allowed
     );
+    sqlx::query("DELETE FROM events WHERE community_id=$1 AND kind=0 AND pubkey<>$2")
+        .bind(community.as_uuid())
+        .bind(owner.public_key().as_bytes().as_slice())
+        .execute(db.pool())
+        .await
+        .unwrap();
     sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1 AND id=$2")
         .bind(community.as_uuid())
         .bind(profile.id.as_bytes().as_slice())
@@ -294,7 +304,7 @@ async fn popular_media_prefers_live_readable_references_and_bounds_work() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("work budget"), "{error}");
-    // Capacity saturation returns before attempting to acquire a writer.
+    // Capacity saturation has a bounded wait before attempting to acquire a writer.
     let permits = db.media_authorization_slots.available_permits();
     let _held = db
         .media_authorization_slots
@@ -313,7 +323,26 @@ async fn popular_media_prefers_live_readable_references_and_bounds_work() {
         )
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("capacity exceeded"), "{error}");
+    assert!(
+        matches!(error, crate::DbError::MediaAuthorizationCapacity),
+        "{error}"
+    );
+    // Poll until the request is queued, then release capacity without a delay.
+    let reader_pubkey = reader.public_key();
+    let waiting = db.media_access(
+        community,
+        &hash,
+        "bin",
+        &base,
+        reader_pubkey.as_bytes(),
+        false,
+        |_, _| true,
+    );
+    tokio::pin!(waiting);
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+    drop(_held);
+    assert_eq!(waiting.await.unwrap(), MediaAccess::Allowed);
+
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(db.pool())
@@ -334,6 +363,8 @@ async fn media_reference_full_query_plans() {
     let mut tx = pool.begin().await.unwrap();
     let fixture = include_str!("media_plan_fixture.sql");
     sqlx::raw_sql(fixture).execute(&mut *tx).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE INDEX idx_events_media_edit_target ON media_access_plan.events (community_id,channel_id, ({}),created_at DESC,id DESC) WHERE kind=40003 AND deleted_at IS NULL", super::media::MEDIA_EDIT_TARGET_SQL)))
+        .execute(&mut *tx).await.unwrap();
     sqlx::query("SET LOCAL statement_timeout = '2s'")
         .execute(&mut *tx)
         .await
@@ -342,24 +373,118 @@ async fn media_reference_full_query_plans() {
     let hash = "a".repeat(64);
     let reader = [0x11; 32];
     let needles = super::media::media_reference_needles(&hash, "bin", "https://plan.example/media");
-    for probe in 0..3 {
-        let mut builder =
-            super::media::media_reference_query(community, &hash, &reader, &needles, probe, true);
-        let mut statement = builder.build();
-        let args = statement.take_arguments().unwrap().unwrap();
-        let sql = format!(
-            "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) {}",
-            statement.sql().as_str()
-        );
-        // Only the production QueryBuilder SQL is prefixed; all values stay bound.
-        let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
-            .fetch_all(&mut *tx)
-            .await
-            .unwrap();
-        println!("FULL_QUERY_PROBE_{probe}: 24 partitions, 1200000 rows including 24000 edits in one channel");
-        for row in rows {
-            println!("{}", row.get::<String, _>(0));
+    for readable_only in [true, false] {
+        for probe in 0..3 {
+            let mut builder = super::media::media_reference_query(
+                community,
+                &hash,
+                &reader,
+                &needles,
+                probe,
+                readable_only,
+            );
+            let mut statement = builder.build();
+            let args = statement.take_arguments().unwrap().unwrap();
+            let sql = format!(
+                "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) {}",
+                statement.sql().as_str()
+            );
+            // Only the production QueryBuilder SQL is prefixed; all values stay bound.
+            let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(&mut *tx)
+                .await
+                .unwrap();
+            println!("FULL_QUERY_PROBE_{probe}_READABLE_{readable_only}: 24 partitions, 1200000 rows including 300000 live edits across 256 channels");
+            let plan = rows
+                .iter()
+                .map(|row| row.get::<String, _>(0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if readable_only && probe < 2 {
+                let names: Vec<String> = sqlx::query_scalar("SELECT c.relname::text FROM pg_inherits h JOIN pg_class c ON c.oid=h.inhrelid WHERE h.inhparent='media_access_plan.idx_events_media_edit_target'::regclass")
+                .fetch_all(&mut *tx).await.unwrap();
+                assert!(
+                    names.iter().any(|name| plan.contains(name)),
+                    "edit-target index absent: {plan}"
+                );
+            }
+            for row in rows {
+                println!("{}", row.get::<String, _>(0));
+            }
         }
     }
+    tx.rollback().await.unwrap();
+}
+
+/// Compare the production Rust target rule to SQL, the catalog and new partitions.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn media_edit_target_sql_parity_and_partition_inheritance() {
+    use serde_json::json;
+    let pool = sqlx::PgPool::connect(&crate::test_support::database_url())
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let expression = super::media::MEDIA_EDIT_TARGET_SQL;
+    let a = "aB".repeat(32);
+    let b = "C".repeat(64);
+    let cases = [
+        json!([["e", a.to_uppercase()]]),
+        json!([["e", a]]),
+        json!([["e", "bad"], ["e", a], ["e", b]]),
+        json!([["e", a], ["e", b]]),
+        json!([["e"], ["e", 23], ["e", a]]),
+        json!([["e"]]),
+        json!([["e", 23]]),
+        json!([null, ["e", a]]),
+        json!(null),
+        json!([]),
+    ];
+    let absent: Option<Vec<u8>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT {expression} FROM (SELECT NULL::jsonb AS tags) input"
+    )))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert!(absent.is_none());
+    let keys = Keys::generate();
+    for tags in cases {
+        // Non-string historical tags cannot be signed by the Rust SDK; omit
+        // malformed tags when constructing its reference input.
+        let valid_tags: Vec<Tag> = tags
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tag| {
+                let values: Option<Vec<&str>> =
+                    tag.as_array()?.iter().map(|v| v.as_str()).collect();
+                Tag::parse(values?).ok()
+            })
+            .collect();
+        let event = EventBuilder::new(Kind::Custom(40003), "")
+            .tags(valid_tags)
+            .sign_with_keys(&keys)
+            .unwrap();
+        let expected = buzz_core::media::first_edit_target(&event);
+        let actual: Option<Vec<u8>> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT {expression} FROM (SELECT $1::jsonb AS tags) input"
+        )))
+        .bind(&tags)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(actual, expected, "tags={tags}");
+    }
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE TEMP TABLE media_expected_target(tags jsonb); CREATE INDEX media_expected_target_idx ON media_expected_target (({expression}));")))
+        .execute(&mut *tx).await.unwrap();
+    let expressions: Vec<String> = sqlx::query_scalar("SELECT pg_get_expr(indexprs,indrelid) FROM pg_index WHERE indexrelid IN ('media_expected_target_idx'::regclass,'public.idx_events_media_edit_target'::regclass) ORDER BY indexrelid")
+        .fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(expressions.len(), 2);
+    assert_eq!(expressions[0], expressions[1]);
+    sqlx::raw_sql("CREATE TABLE media_partition_parent (LIKE public.events INCLUDING ALL) PARTITION BY RANGE (created_at); CREATE TABLE media_future_partition PARTITION OF media_partition_parent FOR VALUES FROM ('2099-01-01') TO ('2099-02-01');")
+        .execute(&mut *tx).await.unwrap();
+    let inherited: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indexrelid JOIN pg_index parent ON parent.indexrelid=h.inhparent WHERE i.indrelid='media_future_partition'::regclass AND parent.indexprs IS NOT NULL AND i.indisvalid AND pg_get_expr(i.indexprs,i.indrelid)=(SELECT pg_get_expr(indexprs,indrelid) FROM pg_index WHERE indexrelid='public.idx_events_media_edit_target'::regclass))")
+        .fetch_one(&mut *tx).await.unwrap();
+    assert!(inherited);
     tx.rollback().await.unwrap();
 }

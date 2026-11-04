@@ -61,8 +61,13 @@ media access through the ordinary media endpoint.
 
 ## Rollout and recovery
 
-1. Apply migration 0083 (or desired-state schema) before enabling recording.
-   It adds plain tenant tables, with no triggers, foreign keys or data rewrite.
+1. Before any pod enters shadow, [prebuild and verify the edit-target index](private-media-index-deployment.md)
+   concurrently per partition, then apply migrations 0083–0084 (or desired-state schema).
+   Populated databases without the index fail migration/startup; with auto-migration
+   disabled, bypassing the required schema step can cause lookup timeouts/503 in
+   enforce. Restore off, complete prebuild/verification, then begin shadow.
+   The migrations add plain tenant tables and an index, with no SQL functions,
+   triggers, foreign keys or data rewrite.
 2. Deploy the new binary on every writer with mode `off`.
 3. Restart all writers in `shadow`; inspect
    `buzz_media_read_access_total{mode="shadow",reason="no_ref"}`,
@@ -98,8 +103,9 @@ share. This policy does not prevent authorized recipients from copying data.
 
 Media authorization uses a shared semaphore across database-handle clones,
 limited to one quarter of the writer pool, capped at eight lookups. Saturation
-returns an authorization-unavailable error before pool acquisition. Every Range
-request reauthorizes; large emoji sets have no 64-reference cap and checks run
+waits up to 500 ms before returning authorization-unavailable, counted with
+`reason="capacity"`, before pool acquisition. Every Range
+request reauthorizes; ordinary events have a 512-reference cap, emoji list/set kinds are exempt, and checks run
 sequentially within that connection bound. Missing sidecars reject publication
 in enforce mode; shadow counts failures and accepts the write, including stale
 avatar metadata edits and upload-proof/publication-marker errors.

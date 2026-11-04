@@ -778,7 +778,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 83);
+        assert_eq!(migrations.len(), 84);
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
         }
@@ -2887,6 +2887,8 @@ mod postgres_tests {
             .expect("apply migrations for schema parity");
 
         for table in [
+            "media_uploaders",
+            "media_publications",
             "relay_admin_actions",
             "relay_admin_outbox",
             "relay_operator_audit",
@@ -2915,6 +2917,14 @@ mod postgres_tests {
                  migration and schema.sql must both use a representable shape."
             );
         }
+        async fn media_edit_index(pool: &PgPool) -> (String, String, String) {
+            sqlx::query_as("SELECT pg_get_indexdef(indexrelid),indoption::text,pg_get_expr(indexprs,indrelid) FROM pg_index WHERE indexrelid='public.idx_events_media_edit_target'::regclass AND indisvalid AND indisready AND indislive")
+                .fetch_one(pool).await.expect("valid media edit index")
+        }
+        assert_eq!(
+            media_edit_index(&desired).await,
+            media_edit_index(&migrated).await
+        );
         // `channels` columns only: pgschema re-emits `idx_channels_id_live`
         // without its `INCLUDE (community_id)`, an index drift that predates
         // this check.
@@ -3144,6 +3154,7 @@ mod postgres_tests {
             .execute(&pool)
             .await
             .expect("repair ambiguous row");
+        crate::test_support::prebuild_media_edit_index(&pool).await;
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
@@ -3223,6 +3234,7 @@ mod postgres_tests {
             vec![(1, Some(true)), (30_179, Some(true)), (30_350, None)]
         );
 
+        crate::test_support::prebuild_media_edit_index(&pool).await;
         run_migrations(&pool)
             .await
             .expect("apply remaining migrations to populated database");
@@ -3649,5 +3661,49 @@ mod postgres_tests {
             .execute(&pool)
             .await
             .is_err());
+    }
+    /// Populated upgrades require the operator prebuild; bad indexes never pass.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn media_edit_index_upgrade_requires_verified_prebuild() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 83).await.unwrap();
+        let community = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities(id,host) VALUES($1,'media-index-upgrade.example')")
+            .bind(community)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO events(community_id,id,pubkey,created_at,kind,tags,content,sig) VALUES($1,decode(repeat('a',64),'hex'),decode(repeat('b',64),'hex'),now(),9,'[]','media',decode(repeat('c',128),'hex'))")
+            .bind(community).execute(&pool).await.unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prebuild idx_events_media_edit_target"),
+            "{error}"
+        );
+        sqlx::query("CREATE INDEX idx_events_media_edit_target ON events(community_id,id)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = run_migrations(&pool).await.unwrap_err();
+        assert!(
+            error.to_string().contains("invalid or wrong definition"),
+            "{error}"
+        );
+        sqlx::query("DROP INDEX idx_events_media_edit_target")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::test_support::prebuild_media_edit_index(&pool).await;
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "upgrade preserves old relay rows");
     }
 }

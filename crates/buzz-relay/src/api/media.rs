@@ -616,6 +616,7 @@ async fn upload_blob_result(
         .map_err(|e| media_denial(e, strictness))?;
 
     if state.config.media_read_mode != super::media_access::MediaReadMode::Off {
+        let mut recording_reason = "lookup_error";
         let recording: Result<(), MediaDenial> = async {
             // A reupload of a legacy attachment must remember that it has been
             // published before recording new preview authority. Otherwise purging
@@ -638,7 +639,12 @@ async fn upload_blob_result(
                     crate::handlers::req::event_visible_to_reader,
                 )
                 .await
-                .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+                .map_err(|error| {
+                    if matches!(error, buzz_db::DbError::MediaAuthorizationCapacity) {
+                        recording_reason = "capacity";
+                    }
+                    media_denial(MediaError::AuthorizationUnavailable, strictness)
+                })?;
             if matches!(
                 existing,
                 buzz_db::media::MediaAccess::Allowed | buzz_db::media::MediaAccess::Restricted
@@ -665,7 +671,7 @@ async fn upload_blob_result(
         }
         .await;
         if let Err(error) = recording {
-            metrics::counter!("buzz_media_upload_access_total", "mode" => state.config.media_read_mode.label(), "reason" => "lookup_error").increment(1);
+            metrics::counter!("buzz_media_upload_access_total", "mode" => state.config.media_read_mode.label(), "reason" => recording_reason).increment(1);
             if state.config.media_read_mode == super::media_access::MediaReadMode::Enforce {
                 return Err(error);
             }

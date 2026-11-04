@@ -5,6 +5,14 @@ use buzz_datastore_tracing::datastore_span;
 use futures_util::TryStreamExt;
 use sqlx::{Postgres, QueryBuilder, Row};
 
+// Unqualified tags lets this exact expression serve indexes and aliased probes.
+// Keep DDL/catalog and Rust target parity covered by the PostgreSQL tests.
+pub(crate) const MEDIA_EDIT_TARGET_SQL: &str = r#"decode(lower(jsonb_path_query_first(tags, 'strict $[*] ? (@[0] == "e" && @[1] like_regex "^[0-9A-Fa-f]{64}$")[1]', '{}'::jsonb, true) #>> '{}'), 'hex')"#;
+
+fn edit_target(alias: &str) -> String {
+    MEDIA_EDIT_TARGET_SQL.replacen("(tags,", &format!("({alias}.tags,"), 1)
+}
+
 /// Result of a complete live-reference lookup, for bounded denial metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaAccess {
@@ -75,10 +83,13 @@ impl Db {
         for_publication: bool,
         visible: fn(&nostr::Event, &[u8]) -> bool,
     ) -> Result<MediaAccess> {
-        let _permit = self
-            .media_authorization_slots
-            .try_acquire()
-            .map_err(|_| DbError::InvalidData("media authorization capacity exceeded".into()))?;
+        let _permit = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            self.media_authorization_slots.acquire(),
+        )
+        .await
+        .map_err(|_| DbError::MediaAuthorizationCapacity)?
+        .map_err(|_| DbError::MediaAuthorizationCapacity)?;
         let connection = crate::observability::acquire_writer(
             &self.pool,
             crate::observability::WriterOperation::Authorization,
@@ -205,17 +216,7 @@ pub(super) fn media_reference_query(
     probe: usize,
     readable_only: bool,
 ) -> QueryBuilder<Postgres> {
-    // Parse each live edit target once per statement. A correlated JSON scan
-    // for every attachment candidate amplifies popular-channel edit histories.
-    let mut query = QueryBuilder::<Postgres>::new(
-        "WITH media_edits AS MATERIALIZED (SELECT id,channel_id,created_at, \
-         decode((SELECT tag->>1 FROM jsonb_array_elements(tags) WITH ORDINALITY AS t(tag,ord) \
-         WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1),'hex') AS target \
-         FROM events WHERE community_id=",
-    );
-    query
-        .push_bind(*community.as_uuid())
-        .push(" AND kind=40003 AND deleted_at IS NULL) ");
+    let mut query = QueryBuilder::<Postgres>::new("");
     query.push("SELECT id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id,");
     query.push(if readable_only { "true" } else { "false" });
     query.push(" AS readable FROM (");
@@ -228,23 +229,31 @@ pub(super) fn media_reference_query(
                          AND m.removed_at IS NULL AND m.pubkey="
             );
     query
-                .push_bind(pubkey)
-                .push(
-                    ")))) AND (e.kind <> 40003 OR EXISTS (SELECT 1 FROM events original \
+        .push_bind(pubkey)
+        .push(
+            ")))) AND (e.kind <> 40003 OR EXISTS (SELECT 1 FROM events original \
                 WHERE original.community_id=e.community_id AND original.channel_id=e.channel_id \
                 AND original.deleted_at IS NULL AND original.kind IN (9,40002) \
-                AND lower((SELECT tag->>1 FROM jsonb_array_elements(e.tags) WITH ORDINALITY AS t(tag,ord) \
-                    WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1))=encode(original.id,'hex') \
-                AND NOT EXISTS (SELECT 1 FROM media_edits newer \
-                    WHERE newer.channel_id=e.channel_id \
-                    AND (newer.created_at,newer.id) > (e.created_at,e.id) \
-                    AND newer.target=original.id))) \
-                AND (e.kind NOT IN (9,40002) OR NOT EXISTS (SELECT 1 FROM media_edits edit \
-                    WHERE edit.channel_id=e.channel_id \
-                    AND edit.target=e.id))) AS readable \
-                FROM events e WHERE e.community_id=",
-                )
-                .push_bind(*community.as_uuid()).push(" AND e.deleted_at IS NULL");
+                AND ",
+        )
+        .push(edit_target("e"))
+        .push(
+            "=original.id AND NOT EXISTS (SELECT 1 FROM events newer \
+                    WHERE newer.community_id=e.community_id AND newer.channel_id=e.channel_id \
+                    AND newer.kind=40003 AND newer.deleted_at IS NULL \
+                    AND (newer.created_at,newer.id) > (e.created_at,e.id) AND ",
+        )
+        .push(edit_target("newer"))
+        .push(
+            "=original.id))) \
+                AND (e.kind NOT IN (9,40002) OR NOT EXISTS (SELECT 1 FROM events edit \
+                    WHERE edit.community_id=e.community_id AND edit.channel_id=e.channel_id \
+                    AND edit.kind=40003 AND edit.deleted_at IS NULL AND ",
+        )
+        .push(edit_target("edit"))
+        .push("=e.id))) AS readable FROM events e WHERE e.community_id=")
+        .push_bind(*community.as_uuid())
+        .push(" AND e.deleted_at IS NULL");
     if probe == 2 {
         // Never scan message bodies. Only profiles have content references;
         // current profiles are indexed by community/kind/deleted_at.
@@ -254,26 +263,31 @@ pub(super) fn media_reference_query(
             .push(") > 0 OR strpos(e.content, E'\\\\u') > 0)");
     } else {
         query.push(" AND (");
-        for (i, needle) in (if probe == 0 {
+        let selected = if probe == 0 {
             &needles[..1]
         } else {
             &needles[1..]
-        })
-        .iter()
-        .enumerate()
-        {
+        };
+        for (i, tag) in ["imeta", "picture", "emoji"].into_iter().enumerate() {
+            let matching: Vec<serde_json::Value> = selected
+                .iter()
+                .filter(|needle| needle[0][0].as_str() == Some(tag))
+                .cloned()
+                .collect();
             if i > 0 {
                 query.push(" OR ");
             }
             query.push("(");
-            let tag = needle[0][0].as_str().unwrap_or("");
             if tag == "picture" {
                 query.push("e.kind=39000 AND ");
             }
             if tag == "emoji" {
                 query.push("e.kind IN (10030,30030) AND ");
             }
-            query.push("e.tags @> ").push_bind(needle).push(")");
+            query
+                .push("e.tags @> ANY(")
+                .push_bind(matching)
+                .push("::jsonb[]))");
         }
         query.push(")");
     }
@@ -317,6 +331,12 @@ pub(super) fn media_reference_query(
             .push(")");
         query.push(" AND (kind <> ALL(").push_bind(shared).push(") OR pubkey=").push_bind(pubkey)
             .push(" OR jsonb_path_query_array(tags, '$[*] ? (@[0] == \"shared\")') = '[[\"shared\",\"true\"]]'::jsonb)");
+    }
+    if probe == 2 {
+        query
+            .push(" ORDER BY (strpos(content, ")
+            .push_bind(sha256)
+            .push(") > 0) DESC");
     }
     query.push(" LIMIT 1025");
     query

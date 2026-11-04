@@ -116,6 +116,22 @@ pub fn publication_hashes(event: &Event, base: &str) -> BTreeSet<String> {
     out
 }
 
+/// First valid edit target in signed tag order, accepting all ASCII hex casing.
+pub fn first_edit_target(event: &nostr::Event) -> Option<Vec<u8>> {
+    event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        let value = parts.get(1)?;
+        if parts.first().map(String::as_str) == Some("e")
+            && value.len() == 64
+            && value.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            hex::decode(value).ok()
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

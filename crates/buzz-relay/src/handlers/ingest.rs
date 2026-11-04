@@ -1411,26 +1411,8 @@ async fn validate_edit_ownership(
     event: &Event,
     state: &AppState,
 ) -> Result<(), String> {
-    let target_hex = event
-        .tags
-        .iter()
-        .find_map(|t| {
-            if t.kind().to_string() == "e" {
-                t.content().and_then(|v| {
-                    if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
-                        Some(v.to_string())
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
+    let target_bytes = buzz_core::media::first_edit_target(event)
         .ok_or_else(|| "missing e tag for edit target".to_string())?;
-
-    let target_bytes =
-        hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     // Kind 40003 skips the generic membership gate, so this validator is the
     // only authority: a target outside the edit's `h` channel, unreadable, or
     // not the actor's to edit is denied exactly like a missing one.

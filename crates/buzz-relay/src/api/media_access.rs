@@ -86,7 +86,14 @@ pub(super) async fn enforce_read(
         Ok(buzz_db::media::MediaAccess::Restricted) => ("not_member", Some(MediaError::NotFound)),
         Err(error) => {
             tracing::warn!(error_kind = %error.kind(), "media authorization lookup failed");
-            ("lookup_error", Some(MediaError::AuthorizationUnavailable))
+            (
+                if matches!(error, buzz_db::DbError::MediaAuthorizationCapacity) {
+                    "capacity"
+                } else {
+                    "lookup_error"
+                },
+                Some(MediaError::AuthorizationUnavailable),
+            )
         }
     };
     metrics::counter!("buzz_media_read_access_total", "mode" => mode.label(), "reason" => reason)

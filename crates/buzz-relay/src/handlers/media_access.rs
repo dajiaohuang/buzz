@@ -15,6 +15,26 @@ pub(crate) async fn validate_media_references(
     }
     let base = crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
     let hashes = buzz_core::media::publication_hashes(event, &base);
+    if hashes.len() > 512 && !matches!(event.kind.as_u16(), 10030 | 30030) {
+        metrics::counter!("buzz_media_publication_access_total", "mode" => mode.label(), "reason" => "limit").increment(1);
+        return if mode == MediaReadMode::Enforce {
+            Err(IngestError::Rejected(
+                "restricted: too many attachment references".into(),
+            ))
+        } else {
+            // Skip per-reference fan-out, but retain a single best-effort
+            // publication boundary batch for accepted shadow events.
+            if state
+                .db
+                .record_media_publications(tenant.community(), hashes.into_iter().collect())
+                .await
+                .is_err()
+            {
+                metrics::counter!("buzz_media_publication_access_total", "mode" => mode.label(), "reason" => "record_error").increment(1);
+            }
+            Ok(())
+        };
+    }
     let author = super::ingest::effective_message_author(event, &state.relay_keypair.public_key());
     for hash in &hashes {
         let checked = async {
@@ -49,9 +69,13 @@ pub(crate) async fn validate_media_references(
                     super::req::event_visible_to_reader,
                 )
                 .await
-                .map_err(|_| {
+                .map_err(|error| {
                     (
-                        "lookup_error",
+                        if matches!(error, buzz_db::DbError::MediaAuthorizationCapacity) {
+                            "capacity"
+                        } else {
+                            "lookup_error"
+                        },
                         IngestError::Internal("error: media authorization unavailable".into()),
                     )
                 })?;

@@ -345,6 +345,16 @@ async fn private_media_revocation_http_journey() {
         .insert_event(tenant.community(), &message, Some(channel))
         .await
         .unwrap();
+    // A normal channel view can request attachments and avatars in parallel.
+    let requests = (0..32)
+        .map(|_| router(state.clone()).oneshot(get(&member, &host, &hash, &hash, "GET", None)));
+    for response in futures_util::future::join_all(requests).await {
+        assert_eq!(
+            response.unwrap().status(),
+            StatusCode::OK,
+            "32 concurrent authorized reads"
+        );
+    }
     // Real thumbnail keys ensure alias positives cannot pass vacuously.
     for variant in ["jpg", "webp"] {
         bucket.objects.lock().await.insert(
@@ -719,7 +729,7 @@ async fn private_media_revocation_http_journey() {
     );
     // Large real emoji sets remain editable; shadow never refuses new checks.
     let mut emoji_tags = vec![Tag::parse(["d", "large"]).unwrap()];
-    for n in 1000..1070 {
+    for n in 1000..1513 {
         let emoji_hash = format!("{n:064x}");
         state
             .db
@@ -764,8 +774,26 @@ async fn private_media_revocation_http_journey() {
         .unwrap();
     crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
         .await
-        .expect("enforce supports more than 64 distinct emoji");
+        .expect("enforce exempts emoji sets from the 512-reference cap");
     let shadow = fixture(&endpoint, super::media_access::MediaReadMode::Shadow).await;
+    let many_tags: Vec<Tag> = (0..513)
+        .map(|n| Tag::parse(["imeta", &format!("url http://{host}/media/{n:064x}.bin")]).unwrap())
+        .collect();
+    let oversized = EventBuilder::new(Kind::Custom(9), "")
+        .tags(many_tags)
+        .sign_with_keys(&owner)
+        .unwrap();
+    let error =
+        crate::handlers::media_access::validate_media_references(&tenant, &state, &oversized)
+            .await
+            .unwrap_err();
+    assert!(
+        matches!(error, crate::handlers::ingest::IngestError::Rejected(message) if message.contains("too many attachment"))
+    );
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &oversized)
+        .await
+        .expect("shadow counts and accepts publication cap");
+
     let stale_profile = EventBuilder::new(
         Kind::Metadata,
         serde_json::json!({"picture":format!("http://{host}/media/{}.bin", "f".repeat(64))})
