@@ -422,6 +422,7 @@ pub(crate) async fn nip11_document(
             })?;
         crate::nip_fi_policy::Policy {
             community_id: *tenant.community().as_uuid(),
+            generation: 0,
             mode: state.config.nip_fi.mode,
             required: false,
             stored_required: false,

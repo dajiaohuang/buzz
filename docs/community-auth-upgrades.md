@@ -354,15 +354,18 @@ There is no public arm, external discharge, force-active, reset or clear API.
 Do not set the baseline through operational SQL as a substitute for verification.
 
 A baseline authority must prove the complete serving-route inventory, compatible
-images/capabilities, and absence of every old or dark-mode nonparticipant and
+images/capabilities, and absence of every old, Off-mode or dark bypass nonparticipant and
 its work. It must enforce admission and routing restrictions against reentry.
 An evidence-kind string, caller assertion, missing pod or signed inventory
 snapshot alone is insufficient. No such authority is included here.
 
 Before an eventual baseline is armed, all serving routes must be covered.
-After arming, a new process must participate before serving *any* host, including
-free hosts. Invalidating the epoch does not restore startup bypass. Without writer
-access it cannot register and cannot open the public listener. This adds startup/scale-out
+After arming, a new Shadow/Enforce process must participate before serving *any*
+host, including free hosts. Invalidating the epoch does not restore its startup
+bypass. Without writer access it cannot register or open the public listener.
+Off processes remain FI nonparticipants even with operations or an armed epoch;
+the future authority must exclude them from serving coverage and prevent reentry,
+including transitions from Off to Shadow/Enforce. This adds startup/scale-out
 availability cost. Already-participating free sessions preserve existing outage
 behavior; there are no periodic registration leases or automatic fleet drains.
 These are startup guarantees. Already-running bypass boots have no reconcile
@@ -390,15 +393,17 @@ observations remain in their separate observation registry.
 ## Tracking rollout and abort criteria (BUZZ-512 partial draft)
 
 `BUZZ_NIP_FI_ACTIVATION_TRACKING_ENABLED=false` is the default pre-arming
-setting. With both tracking and upgrade acceptance disabled, a writer scope with
+setting. In Shadow/Enforce, with both tracking and upgrade acceptance disabled,
+a writer scope with
 no operations, `verified=false`, and baseline epoch zero may skip boot registration,
 work tickets, per-frame tracker locks and detached HTTP ownership. Startup still
 checks that condition under the writer scope lock; a writer error prevents the
 public listener from opening. Enabling upgrade acceptance also opts the boot into
 tracking. The registered boot remains tracked for its whole process lifetime.
 
-Any operation, a positive baseline epoch, or a verified baseline forces startup
-registration regardless of this setting. Epochs only advance, including on
+In Shadow/Enforce, any operation, a positive baseline epoch, or a verified baseline
+forces startup registration regardless of this setting. Off never performs this
+FI startup check and remains a nonparticipant regardless of durable scope state. Epochs only advance, including on
 invalidation; invalidating a baseline cannot restore bypass. Registration and the
 bypass decision serialize with enable and baseline changes. No registration error
 falls back to unregistered public serving. The health listener binds only after
@@ -412,8 +417,8 @@ future trusted authority verifies an epoch, it must recompute completion from
 persisted exact ACKs under the scope lock; already satisfied boots must not need
 perpetual ACK writes to trigger that transition.
 
-On its first durable observation of a required community, a running bypass boot
-installs the floor and signals that community's untracked root/audio sockets with
+On its first durable observation of a required community, a running Shadow/Enforce
+bypass boot installs the floor and signals that community's untracked root/audio sockets with
 Close 1008 `community authentication upgraded`. The registry remembers the
 observation by immutable community ID so a late untracked registration also
 closes; tracked compliant reconnects survive. This does not start a reconciliation
@@ -421,16 +426,18 @@ worker or register the dark boot. A hint alone is not an observation. Cancellati
 cannot establish that every dark boot observed the change or that untracked HTTP,
 handler or producer work drained, and produces no boot ACK or active evidence.
 
-A **dark bypass boot is not a verified participant**. There is no production
+An **Off boot or dark bypass boot is not a verified participant**. There is no production
 arming endpoint in this draft. A future trusted arming authority must establish
 that every route is covered by registered tracking-capable boots and that every
-dark bypass boot has permanently stopped serving and cannot reenter before
+Off or dark bypass boot has permanently stopped serving and cannot reenter before
 advancing the epoch. A config rollout, registry list, or readiness observation is
-insufficient. Before enabling upgrade acceptance, stop/restart every bypass boot into
-registered tracking; do not accept the first operation while any bypass boot
-can still serve. A dark boot does not discover an arming transition in the
-background: the missing authority must establish permanent exclusion of every
-such incarnation. Starting this build with tracking disabled is not permission
+insufficient. Before enabling upgrade acceptance, stop every Off and dark bypass boot and
+restart the intended participants in Shadow/Enforce with registered tracking;
+do not accept the first operation while any such nonparticipant can still serve.
+A dark boot does not discover an arming transition in the background: the missing authority must establish permanent exclusion of every
+such incarnation, including exclusion of Off→Shadow/Enforce reentry until the
+new participant passes registration and the future authority's coverage checks.
+Starting this build with tracking disabled is not permission
 to arm a mixed fleet. Dark opt-in boots that crash remain durable participants and become
 pending obligations at enable; they cannot disappear at first arming. Likewise,
 boots which predate registration need trusted inventory and non-serving/no-reentry
@@ -485,3 +492,27 @@ turn off tracking for serving participants, or drain the fleet automatically.
 Generation cancellation and post-upgrade refusal use Close 1008 with reason
 `community authentication upgraded`; reconnect with a fresh, valid required
 assertion. Handshake-time refusals retain their HTTP denial behavior.
+
+### Relay mode and activation
+
+Off preserves accepted durable requirements but suspends FI application. It
+does not register an activation worker, install generation floors, drain
+sessions, or ACK application. Operator POST and status responses remain
+`pending` with `relay_mode_off` while the target is otherwise available;
+historical activation evidence remains intact. An unavailable target remains
+`unavailable`. In a mixed Off/Shadow fleet, POST/status readback depends on the
+serving pod: Off projects `pending` with `relay_mode_off`, while Shadow reports
+the persisted state subject to its normal trust checks. The projection does not
+change durable acceptance or historical activation evidence.
+
+Required-admission readiness is zero in Off even when a verifier, deny map and
+connection lifetime are configured. Alerts on `buzz_nip_fi_required_admission_ready`
+must account for the configured relay mode: zero is expected for Off, while
+Shadow/Enforce require ready dependencies before serving required communities.
+This metric never proves fleet coverage or baseline authority.
+
+Shadow applies stored requirements and reconciles target-session obligations;
+Enforce requires FI globally. Switching from Off to Shadow or Enforce requires
+the normal boot registration, exact-generation drain and baseline evidence
+before completion can be reported. The unfinished production baseline authority
+continues to prevent production `active`.

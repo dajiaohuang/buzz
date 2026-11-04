@@ -9,7 +9,7 @@ mod postgres_tests {
         use buzz_db::community_auth::{UpgradeOutcome, UpgradeRequest};
         let base = real_db_state().await.unwrap();
         let mut configured = (*base).clone();
-        Arc::make_mut(&mut configured.config).nip_fi.mode = buzz_auth::NipFiMode::Off;
+        Arc::make_mut(&mut configured.config).nip_fi.mode = buzz_auth::NipFiMode::Shadow;
         Arc::make_mut(&mut configured.config).nip_fi_activation_tracking_enabled = true;
         let state = Arc::new(configured);
         let keys = nostr::Keys::generate();

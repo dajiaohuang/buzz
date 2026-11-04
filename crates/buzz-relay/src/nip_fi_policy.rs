@@ -235,7 +235,8 @@ pub(crate) async fn admission_mode(
 }
 
 pub(crate) fn required_dependencies_ready(state: &crate::state::AppState) -> bool {
-    state.nip_fi_verifier.is_some()
+    state.config.nip_fi.mode.evaluates()
+        && state.nip_fi_verifier.is_some()
         && state.nip_fi_deny_map.is_some()
         && state.config.nip_fi.max_connection_lifetime().is_some()
 }

@@ -382,6 +382,9 @@ impl crate::state::AppState {
     /// Observe primary policy before scanning dark sockets. This installs no
     /// boot/ACK evidence and cannot prove untracked producers have drained.
     pub(crate) fn observe_required_auth_policy(&self, community: uuid::Uuid, generation: i64) {
+        if self.config.nip_fi.mode.is_off() {
+            return;
+        }
         self.auth_activation
             .require(&community.to_string(), generation);
         self.community_connections
@@ -389,12 +392,13 @@ impl crate::state::AppState {
     }
 
     pub(crate) fn auth_activation_tracking_enabled(&self) -> bool {
-        self.config.nip_fi_activation_tracking_enabled
-            || self.auth_activation_boot.get().is_some()
-            || self
-                .auth_activation
-                .observed_requirement
-                .load(std::sync::atomic::Ordering::Acquire)
+        !self.config.nip_fi.mode.is_off()
+            && (self.config.nip_fi_activation_tracking_enabled
+                || self.auth_activation_boot.get().is_some()
+                || self
+                    .auth_activation
+                    .observed_requirement
+                    .load(std::sync::atomic::Ordering::Acquire))
     }
 
     /// Called only after listeners stop and owned request/socket work has exited.
@@ -434,13 +438,20 @@ impl crate::state::AppState {
     }
 
     /// Establish dark bypass or register before listener admission, then reconcile
-    /// missed policy notifications. `None` means a proven unarmed scope with both
-    /// rollout switches off; any writer/registration failure must prevent serving.
+    /// missed policy notifications in Shadow/Enforce. Off returns `None` without
+    /// consulting FI state. In evaluating modes, `None` means a proven unarmed
+    /// scope with both rollout switches off; writer/registration failure prevents serving.
     /// Reconciliation runs every five seconds. No lease expiry or fleet eviction.
     /// The production verifier is absent, so baseline completion stays disabled.
     pub async fn start_auth_activation(
         self: &Arc<Self>,
     ) -> buzz_db::Result<Option<tokio_util::task::AbortOnDropHandle<()>>> {
+        // Stored requirements stay durable in Off, but this process must not
+        // install enforcement floors, drain sessions or acknowledge application.
+        if self.config.nip_fi.mode.is_off() {
+            metrics::gauge!("buzz_nip_fi_activation_tracking_enabled").set(0.0);
+            return Ok(None);
+        }
         let boot = uuid::Uuid::new_v4();
         if self.auth_activation_boot.get().is_some() {
             return Err(buzz_db::DbError::AccessDenied(
@@ -534,6 +545,42 @@ mod postgres_tests;
 
 #[cfg(test)]
 mod ownership_tests {
+    #[tokio::test]
+    async fn off_skips_activation_and_keeps_existing_work_unrestricted() {
+        let base = crate::state::tests::test_state_with_unreachable_database_url(
+            "postgres://postgres:postgres@127.0.0.1:1/off_activation",
+        )
+        .await;
+        let mut state = (*base).clone();
+        let config = Arc::make_mut(&mut state.config);
+        config.nip_fi.mode = buzz_auth::NipFiMode::Off;
+        config.nip_fi_activation_tracking_enabled = true;
+        config.nip_fi_upgrades_enabled = true;
+        config.nip_fi.max_connection_lifetime_secs = 3600;
+        state.nip_fi_verifier = Some(Arc::new(
+            crate::nip_fi_core::test_support::assertion_verifier(
+                buzz_auth::TokenClass::DedicatedNipFi,
+            ),
+        ));
+        state.nip_fi_deny_map = Some(Arc::new(buzz_auth::NipFiDenyMap::new(16, vec![])));
+        let mut evaluating = state.clone();
+        Arc::make_mut(&mut evaluating.config).nip_fi.mode = buzz_auth::NipFiMode::Shadow;
+        assert!(evaluating.nip_fi_required_admission_ready());
+        let state = Arc::new(state);
+        let community = uuid::Uuid::new_v4();
+        let ticket = state
+            .auth_activation
+            .enter(&community.to_string(), 0)
+            .unwrap();
+        state.observe_required_auth_policy(community, 1);
+        assert!(!ticket.cancellation().is_cancelled());
+        assert_eq!(state.auth_activation.floor(&community.to_string()), 0);
+        assert!(!state.auth_activation_tracking_enabled());
+        assert!(!state.nip_fi_required_admission_ready());
+        assert!(state.start_auth_activation().await.unwrap().is_none());
+        assert!(state.auth_activation_boot.get().is_none());
+    }
+
     #[test]
     fn observed_dark_requirement_catches_late_untracked_registration_only() {
         let registry = crate::state::CommunityConnectionRegistry::new();

@@ -319,9 +319,10 @@ async fn off_upgrade_uses_cached_tenant_without_fi_reads_and_rejects_long_hosts(
     );
     // The actual database is unreachable. Only ordinary cached routing can
     // satisfy this call; a primary FI binding lookup cannot.
-    let (tenant, mode) = bind_for_upgrade(&state, "cached.example").await.unwrap();
+    let (tenant, mode, generation) = bind_for_upgrade(&state, "cached.example").await.unwrap();
     assert_eq!(*tenant.community().as_uuid(), tenant_id);
     assert!(mode.is_off());
+    assert_eq!(generation, 0);
     assert_eq!(source.calls.load(Ordering::SeqCst), 0);
     let long_host = "x".repeat(buzz_core::tenant::MAX_HOST_LEN + 1);
     state.tenant_host_cache.insert(

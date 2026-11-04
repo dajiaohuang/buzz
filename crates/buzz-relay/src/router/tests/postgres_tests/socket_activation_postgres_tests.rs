@@ -28,7 +28,7 @@ mod postgres_tests {
         let base = real_db_state().await.unwrap();
         let mut configured = (*base).clone();
         let config = Arc::make_mut(&mut configured.config);
-        config.nip_fi.mode = buzz_auth::NipFiMode::Off;
+        config.nip_fi.mode = buzz_auth::NipFiMode::Shadow;
         config.nip_fi_activation_tracking_enabled = true;
         let redis_url = std::env::var("REDIS_URL").unwrap();
         let redis_pool = deadpool_redis::Config::from_url(&redis_url)
@@ -282,7 +282,7 @@ mod postgres_tests {
             config.nip_fi.mode = if refusal == Some("issuer") {
                 buzz_auth::NipFiMode::Enforce
             } else {
-                buzz_auth::NipFiMode::Off
+                buzz_auth::NipFiMode::Shadow
             };
             config.nip_fi.communities = crate::nip_fi_config::NipFiCommunities::for_test_any_host(
                 TEST_COMMUNITY_URI,
@@ -468,7 +468,7 @@ mod postgres_tests {
         let base = real_db_state().await.unwrap();
         let mut configured = (*base).clone();
         let config = Arc::make_mut(&mut configured.config);
-        config.nip_fi.mode = buzz_auth::NipFiMode::Off;
+        config.nip_fi.mode = buzz_auth::NipFiMode::Shadow;
         config.nip_fi_activation_tracking_enabled = false;
         config.nip_fi_upgrades_enabled = false;
         config.nip_fi.max_connection_lifetime_secs = 3600;

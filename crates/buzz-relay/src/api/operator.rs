@@ -1238,6 +1238,10 @@ fn upgrade_response(
         record.state = "unavailable".to_owned();
         record.pending_reasons.clear();
     }
+    if state.config.nip_fi.mode.is_off() && record.state != "unavailable" {
+        record.state = "pending".to_owned();
+        record.pending_reasons.push("relay_mode_off".to_owned());
+    }
     Json(record).into_response()
 }
 
@@ -3142,6 +3146,9 @@ mod postgres_tests {
         };
         Arc::get_mut(&mut state).unwrap().nip98_replay =
             Arc::new(SeenOnceReplayGuard(Mutex::new(HashSet::new())));
+        Arc::make_mut(&mut Arc::get_mut(&mut state).unwrap().config)
+            .nip_fi
+            .mode = buzz_auth::NipFiMode::Shadow;
         let issuer_policy = buzz_auth::IssuerPolicy::new(
             NIP_FI_ISSUER.to_owned(),
             vec!["https://commands.example".to_owned()],
@@ -3256,6 +3263,51 @@ mod postgres_tests {
             fresh_upgrade_request(state.clone(), &operator, "GET", &status_path, None).await;
         assert_eq!(status.status(), StatusCode::OK);
         assert_eq!(read_json(status).await, record);
+        // Off still accepts durable requirements, but cannot claim activation.
+        let mut off = (*state).clone();
+        Arc::make_mut(&mut off.config).nip_fi.mode = buzz_auth::NipFiMode::Off;
+        let off = Arc::new(off);
+        let mut off_body: Value = serde_json::from_str(&body).unwrap();
+        off_body["operation_id"] = serde_json::json!(Uuid::new_v4());
+        let accepted = fresh_upgrade_request(
+            off.clone(),
+            &operator,
+            "POST",
+            path,
+            Some(off_body.to_string()),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let accepted = read_json(accepted).await;
+        assert_eq!(accepted["requires_nip_fi"], true);
+        assert_eq!(accepted["state"], "pending");
+        assert!(accepted["pending_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("relay_mode_off")));
+        let status = fresh_upgrade_request(off.clone(), &operator, "GET", &status_path, None).await;
+        assert_eq!(status.status(), StatusCode::OK);
+        assert!(read_json(status).await["pending_reasons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("relay_mode_off")));
+        let mut historical = state
+            .db
+            .community_auth_upgrade_status(id, &operator.public_key().to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        historical.state = "active".into();
+        historical.pending_reasons.clear();
+        historical.activated_at = Some(chrono::Utc::now());
+        let activated_at = historical.activated_at;
+        let suspended = read_json(super::upgrade_response(&off, historical)).await;
+        assert_eq!(suspended["state"], "pending");
+        assert_eq!(
+            suspended["pending_reasons"],
+            serde_json::json!(["relay_mode_off"])
+        );
+        assert_eq!(suspended["activated_at"], serde_json::json!(activated_at));
         let other =
             fresh_upgrade_request(state.clone(), &other_operator, "GET", &status_path, None).await;
         assert_eq!(other.status(), StatusCode::NOT_FOUND);
