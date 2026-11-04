@@ -44,8 +44,7 @@ After the upload pipeline verifies the supplied bytes, the relay records
 optional audit/upload moderation records. An unposted file is previewable by
 its uploader only. Real reuploads may prove possession for another uploader.
 Possession authorizes publication; a known URL/hash alone does not. A registered
-agent may use its owner's upload proof for its profile picture only; unrelated
-attachments and other fields do not inherit that delegation.
+agent must hold its own upload proof or readable reference; owner proof is never inherited.
 
 The shared publication check runs before common ingestion dispatch (WS and
 HTTP, including metadata commands) and before direct workflow persistence.
@@ -96,3 +95,26 @@ existing client caches is a separate client rollout concern.
 Any authorized member may deliberately republish or reupload bytes into a
 readable channel or avatar. Revoking one channel cannot revoke that independent
 share. This policy does not prevent authorized recipients from copying data.
+
+Media authorization uses a shared semaphore across database-handle clones,
+limited to one quarter of the writer pool, capped at eight lookups. Saturation
+returns an authorization-unavailable error before pool acquisition. Every Range
+request reauthorizes; large emoji sets have no 64-reference cap and checks run
+sequentially within that connection bound. Missing sidecars reject publication
+in enforce mode; shadow counts failures and accepts the write, including stale
+avatar metadata edits and upload-proof/publication-marker errors.
+
+During staging soak, abort enforcement if writer authorization acquire p95
+exceeds 50 ms for five minutes, event-write acquire p95 doubles its pre-rollout
+baseline, or media lookup_error/capacity refusal exceeds 0.1% of requests for
+five minutes. Investigate query latency, pool utilization and storage errors
+before retrying. Shadow failures must be repaired before enforce, since a failed
+recording does not establish possession. Uploads made in off mode record no
+proof: uploads not yet posted when enforce starts require reuploading.
+
+New managed-agent creation explicitly downloads the chosen target-local avatar
+with the captured owner's signer, verifies its image bytes and hash, then uploads
+those bytes with the new agent's signer. The agent holds its own possession
+proof. The captured community stays pinned through profile publication, even
+if the owner changes workspaces during transfer. Automatic reconciliation never
+borrows the owner's proof or signer.

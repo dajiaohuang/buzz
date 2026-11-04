@@ -53,10 +53,18 @@ pub(super) async fn enforce_read(
         .split('.')
         .next()
         .ok_or(MediaDenial(MediaError::NotFound, strictness))?;
-    let meta = state.media_storage.get_sidecar(tenant, hash).await.map_err(|error| {
-        let mapped = if matches!(&error, MediaError::StorageError(message) if message.contains("404")) { MediaError::NotFound } else { MediaError::ServiceUnavailable };
-        MediaDenial(mapped, strictness)
-    })?;
+    let meta = state
+        .media_storage
+        .get_sidecar(tenant, hash)
+        .await
+        .map_err(|error| {
+            let mapped = if matches!(&error, MediaError::NotFound) {
+                MediaError::NotFound
+            } else {
+                MediaError::ServiceUnavailable
+            };
+            MediaDenial(mapped, strictness)
+        })?;
     let base = super::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
     let result = state
         .db

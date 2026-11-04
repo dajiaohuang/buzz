@@ -519,7 +519,57 @@ async fn private_media_revocation_http_journey() {
         )
         .await
         .unwrap();
-    let avatar = "b".repeat(64);
+    state
+        .db
+        .add_member(
+            tenant.community(),
+            channel,
+            agent.public_key().as_bytes(),
+            MemberRole::Member,
+            Some(owner.public_key().as_bytes()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        router(state.clone())
+            .oneshot(get(&agent, &host, &hash, &hash, "GET", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "owned agent has access before removal"
+    );
+    state
+        .db
+        .remove_member(
+            tenant.community(),
+            channel,
+            agent.public_key().as_bytes(),
+            owner.public_key().as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        router(state.clone())
+            .oneshot(get(&agent, &host, &hash, &hash, "GET", None))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "owned agent loses access after removal"
+    );
+    let stolen_profile = EventBuilder::new(
+        Kind::Metadata,
+        serde_json::json!({"picture":url}).to_string(),
+    )
+    .sign_with_keys(&agent)
+    .unwrap();
+    assert!(
+        post(&state, &tenant, &agent, stolen_profile).await.is_err(),
+        "removed owned agent cannot turn owner-uploaded private media into its avatar"
+    );
+    let avatar_bytes = b"new agent avatar";
+    let avatar = hex::encode(Sha256::digest(avatar_bytes));
     state
         .db
         .record_media_upload(tenant.community(), &avatar, owner.public_key().as_bytes())
@@ -569,9 +619,42 @@ async fn private_media_revocation_http_journey() {
     )
     .sign_with_keys(&agent)
     .unwrap();
-    post(&state, &tenant, &agent, profile)
+    assert!(
+        post(&state, &tenant, &agent, profile.clone())
+            .await
+            .is_err(),
+        "agent must not borrow owner upload proof"
+    );
+    // The creation path transfers actual bytes with an agent-signed upload.
+    let upload = Request::builder()
+        .method("PUT")
+        .uri("/upload")
+        .header(header::HOST, &host)
+        .header(
+            header::AUTHORIZATION,
+            proof(&agent, &host, &avatar, "upload"),
+        )
+        .header("X-SHA-256", &avatar)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(avatar_bytes.as_slice()))
+        .unwrap();
+    assert_eq!(
+        router(state.clone())
+            .oneshot(upload)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let created_profile = EventBuilder::new(
+        Kind::Metadata,
+        serde_json::json!({"picture":picture}).to_string(),
+    )
+    .sign_with_keys(&agent)
+    .unwrap();
+    post(&state, &tenant, &agent, created_profile)
         .await
-        .expect("agent profile accepts owner's uploaded avatar");
+        .expect("agent's own upload permits creation under enforce");
     let copy = EventBuilder::new(
         Kind::Metadata,
         serde_json::json!({"picture":url}).to_string(),
@@ -634,6 +717,71 @@ async fn private_media_revocation_http_journey() {
         StatusCode::OK,
         "legacy URL-only share"
     );
+    // Large real emoji sets remain editable; shadow never refuses new checks.
+    let mut emoji_tags = vec![Tag::parse(["d", "large"]).unwrap()];
+    for n in 1000..1070 {
+        let emoji_hash = format!("{n:064x}");
+        state
+            .db
+            .record_media_upload(
+                tenant.community(),
+                &emoji_hash,
+                owner.public_key().as_bytes(),
+            )
+            .await
+            .unwrap();
+        let sidecar = bucket
+            .objects
+            .lock()
+            .await
+            .get(&format!(
+                "{}/_meta/{}/{hash}.json",
+                state.config.media.s3_bucket,
+                tenant.community()
+            ))
+            .cloned()
+            .unwrap();
+        bucket.objects.lock().await.insert(
+            format!(
+                "{}/_meta/{}/{emoji_hash}.json",
+                state.config.media.s3_bucket,
+                tenant.community()
+            ),
+            sidecar,
+        );
+        emoji_tags.push(
+            Tag::parse([
+                "emoji",
+                &format!("emoji{n}"),
+                &format!("http://{host}/media/{emoji_hash}.{ext}"),
+            ])
+            .unwrap(),
+        );
+    }
+    let large_set = EventBuilder::new(Kind::Custom(30030), "")
+        .tags(emoji_tags)
+        .sign_with_keys(&owner)
+        .unwrap();
+    crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
+        .await
+        .expect("enforce supports more than 64 distinct emoji");
+    let shadow = fixture(&endpoint, super::media_access::MediaReadMode::Shadow).await;
+    let stale_profile = EventBuilder::new(
+        Kind::Metadata,
+        serde_json::json!({"picture":format!("http://{host}/media/{}.bin", "f".repeat(64))})
+            .to_string(),
+    )
+    .sign_with_keys(&owner)
+    .unwrap();
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &stale_profile)
+        .await
+        .expect("shadow accepts a missing sidecar");
+    assert!(
+        crate::handlers::media_access::validate_media_references(&tenant, &state, &stale_profile)
+            .await
+            .is_err(),
+        "enforce rejects missing sidecars"
+    );
     // Inject a lookup error after a real existing sidecar: authorization fails closed.
     sqlx::query("ALTER TABLE media_uploaders RENAME TO unavailable_media_uploaders")
         .execute(state.db.pool())
@@ -646,6 +794,58 @@ async fn private_media_revocation_http_journey() {
             .unwrap()
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
+    );
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &large_set)
+        .await
+        .expect("shadow accepts database lookup failures");
+    let upload = Request::builder()
+        .method("PUT")
+        .uri("/upload")
+        .header(header::HOST, &host)
+        .header(header::AUTHORIZATION, proof(&owner, &host, &hash, "upload"))
+        .header("X-SHA-256", &hash)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap();
+    assert_eq!(
+        router(shadow.clone())
+            .oneshot(upload)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "shadow upload accepts proof lookup failure"
+    );
+    sqlx::query("ALTER TABLE unavailable_media_uploaders RENAME TO media_uploaders")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE media_publications RENAME TO unavailable_media_publications")
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &large_set)
+        .await
+        .expect("shadow accepts publication recording failure");
+    assert!(
+        crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
+            .await
+            .is_err(),
+        "enforce rejects recording failure"
+    );
+    let upload = Request::builder()
+        .method("PUT")
+        .uri("/upload")
+        .header(header::HOST, &host)
+        .header(header::AUTHORIZATION, proof(&owner, &host, &hash, "upload"))
+        .header("X-SHA-256", &hash)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(bytes.as_slice()))
+        .unwrap();
+    assert_eq!(
+        router(shadow).oneshot(upload).await.unwrap().status(),
+        StatusCode::OK,
+        "shadow upload accepts marker recording failure"
     );
     let absent = "f".repeat(64);
     assert_eq!(

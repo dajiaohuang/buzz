@@ -616,47 +616,60 @@ async fn upload_blob_result(
         .map_err(|e| media_denial(e, strictness))?;
 
     if state.config.media_read_mode != super::media_access::MediaReadMode::Off {
-        // A reupload of a legacy attachment must remember that it has been
-        // published before recording new preview authority. Otherwise purging
-        // the legacy source later could resurrect uploader preview access.
-        let base = media_base_url_for_tenant(&state.config.relay_url, auth.tenant.host());
-        let ext = descriptor
-            .url
-            .rsplit('.')
-            .next()
-            .ok_or_else(|| media_denial(MediaError::Internal, strictness))?;
-        let existing = state
-            .db
-            .media_access(
-                auth.tenant.community(),
-                &descriptor.sha256,
-                ext,
-                &base,
-                auth.auth_event.pubkey.as_bytes(),
-                false,
-                crate::handlers::req::event_visible_to_reader,
-            )
-            .await
-            .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
-        if matches!(
-            existing,
-            buzz_db::media::MediaAccess::Allowed | buzz_db::media::MediaAccess::Restricted
-        ) {
-            state
+        let recording: Result<(), MediaDenial> = async {
+            // A reupload of a legacy attachment must remember that it has been
+            // published before recording new preview authority. Otherwise purging
+            // the legacy source later could resurrect uploader preview access.
+            let base = media_base_url_for_tenant(&state.config.relay_url, auth.tenant.host());
+            let ext = descriptor
+                .url
+                .rsplit('.')
+                .next()
+                .ok_or_else(|| media_denial(MediaError::Internal, strictness))?;
+            let existing = state
                 .db
-                .record_media_publications(auth.tenant.community(), vec![descriptor.sha256.clone()])
+                .media_access(
+                    auth.tenant.community(),
+                    &descriptor.sha256,
+                    ext,
+                    &base,
+                    auth.auth_event.pubkey.as_bytes(),
+                    false,
+                    crate::handlers::req::event_visible_to_reader,
+                )
                 .await
                 .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+            if matches!(
+                existing,
+                buzz_db::media::MediaAccess::Allowed | buzz_db::media::MediaAccess::Restricted
+            ) {
+                state
+                    .db
+                    .record_media_publications(
+                        auth.tenant.community(),
+                        vec![descriptor.sha256.clone()],
+                    )
+                    .await
+                    .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+            }
+            state
+                .db
+                .record_media_upload(
+                    auth.tenant.community(),
+                    &descriptor.sha256,
+                    auth.auth_event.pubkey.as_bytes(),
+                )
+                .await
+                .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+            Ok(())
         }
-        state
-            .db
-            .record_media_upload(
-                auth.tenant.community(),
-                &descriptor.sha256,
-                auth.auth_event.pubkey.as_bytes(),
-            )
-            .await
-            .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+        .await;
+        if let Err(error) = recording {
+            metrics::counter!("buzz_media_upload_access_total", "mode" => state.config.media_read_mode.label(), "reason" => "lookup_error").increment(1);
+            if state.config.media_read_mode == super::media_access::MediaReadMode::Enforce {
+                return Err(error);
+            }
+        }
     }
 
     rewrite_descriptor_urls_for_tenant(

@@ -435,6 +435,13 @@ keeps the source URL, not the target projection. Transfer or kind:0 rejection
 leaves the previous profile intact so normal reconciliation can retry. The
 Agent-managed profiles opt-out still disables automatic reconciliation.
 
+Creation explicitly transfers a chosen target-local avatar: the captured creating
+owner downloads only that image, then the new agent signs an upload of the
+verified bytes before its profile is published. The relay never lends an
+owner's upload proof to the agent. Automatic reconciliation has no owner signer.
+The captured community stays pinned through download, upload and profile publication, even if the active
+workspace changes while the request is awaiting I/O.
+
 The configured community origin set is refreshed through narrow workspace IPC
 before startup restore and when inactive communities change, without resetting
 active community state. After source removal, the shared writer may reuse an

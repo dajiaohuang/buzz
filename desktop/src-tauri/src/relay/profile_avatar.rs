@@ -158,6 +158,58 @@ pub(crate) async fn localize_avatar(
     if !mime.starts_with("image/") {
         return Err("agent avatar must be an image".into());
     }
+    upload_avatar_bytes(state, &target, keys, hash, bytes, &mime, auth_tag).await
+}
+
+/// Explicit creation-time byte transfer. Only the chosen target-local image is
+/// fetched as the creating owner; actual bytes are then uploaded as the new
+/// agent. Reconciliation never inherits this owner capability.
+pub(crate) async fn transfer_created_avatar(
+    state: &AppState,
+    relay: &str,
+    owner: &Keys,
+    agent: &Keys,
+    avatar: Option<&str>,
+    auth_tag: Option<&str>,
+) -> Result<(), String> {
+    let Some(source) = avatar.and_then(|value| url::Url::parse(value).ok()) else {
+        return Ok(());
+    };
+    let target = community_base(relay)?;
+    if source.origin() != target.origin() || !source.path().starts_with("/media/") {
+        return Ok(());
+    }
+    let hash = media_hash(&source)?;
+    let auth = sign_blossom_get_auth_header(owner, target.as_str(), 60)?;
+    let response = state
+        .media_fetch_client
+        .get(source.clone())
+        .timeout(TIMEOUT)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(|e| classify_request_error(&e))?;
+    let bytes = read_bounded(response, MAX_AVATAR_BYTES).await?;
+    if hex::encode(Sha256::digest(&bytes)) != hash {
+        return Err("agent avatar content hash does not match its URL".into());
+    }
+    let mime = detect_and_validate_mime(&bytes)?;
+    if !mime.starts_with("image/") {
+        return Err("agent avatar must be an image".into());
+    }
+    upload_avatar_bytes(state, &target, agent, hash, bytes, &mime, auth_tag).await?;
+    Ok(())
+}
+
+async fn upload_avatar_bytes(
+    state: &AppState,
+    target: &url::Url,
+    keys: &Keys,
+    hash: &str,
+    bytes: Vec<u8>,
+    mime: &str,
+    auth_tag: Option<&str>,
+) -> Result<Option<String>, String> {
     // Preserve the already-uploaded bytes (including animation). Re-encoding
     // changes the content hash and needlessly destroys the portable identity.
     let upload_auth = sign_blossom_upload_auth(keys, hash, 60, target.as_str())?;
@@ -174,7 +226,7 @@ pub(crate) async fn localize_avatar(
             .put(url)
             .timeout(TIMEOUT)
             .header("Authorization", &auth)
-            .header("Content-Type", &mime)
+            .header("Content-Type", mime)
             .header("X-SHA-256", hash)
             .body(body.clone());
         if let Some(tag) = auth_tag {

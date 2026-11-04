@@ -550,3 +550,64 @@ async fn removed_source_projection_query_uses_fixed_signer_and_cannot_redirect()
     assert!(trap.state.data.lock().unwrap().requests.is_empty());
     assert_eq!(picture(&b), projected);
 }
+
+#[tokio::test]
+async fn creation_transfers_only_chosen_bytes_from_owner_to_agent() {
+    let target = server().await;
+    let state = state(&[&target]);
+    let owner = Keys::generate();
+    let agent = Keys::generate();
+    let avatar = seed(&target, image(3));
+    let external = server().await;
+    // A workspace switch after creation captured its target must not retarget
+    // either the owner download or the agent's profile publication.
+    *state.relay_url_override.lock().unwrap() = Some(external.state.base.clone());
+    assert_eq!(
+        crate::publish_created_agent_profile(
+            &state,
+            &target.state.base,
+            &owner,
+            &agent,
+            "Carl",
+            Some(&avatar),
+            None,
+            None
+        )
+        .await,
+        None
+    );
+    {
+        let data = target.state.data.lock().unwrap();
+        assert_eq!(
+            data.requests
+                .iter()
+                .find(|(method, _)| method == "read")
+                .unwrap()
+                .1
+                .pubkey,
+            owner.public_key()
+        );
+        assert_eq!(
+            data.requests
+                .iter()
+                .find(|(method, _)| method == "upload")
+                .unwrap()
+                .1
+                .pubkey,
+            agent.public_key()
+        );
+        assert_eq!(data.profiles.last().unwrap().pubkey, agent.public_key());
+    }
+    // Arbitrary external URLs never receive the owner's credentials.
+    transfer_created_avatar(
+        &state,
+        &target.state.base,
+        &owner,
+        &agent,
+        Some(&seed(&external, image(4))),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(external.state.data.lock().unwrap().requests.is_empty());
+}

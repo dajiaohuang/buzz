@@ -59,23 +59,6 @@ impl Db {
         Ok(())
     }
 
-    /// Owner-uploaded bytes may become a registered agent's profile picture.
-    /// Callers must restrict this delegation to that one field, not messages.
-    pub async fn agent_owner_uploaded_media(
-        &self,
-        community: CommunityId,
-        hash: &str,
-        agent: &[u8],
-    ) -> Result<bool> {
-        let mut connection = crate::observability::acquire_writer(
-            &self.pool,
-            crate::observability::WriterOperation::Authorization,
-        )
-        .await?;
-        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users u JOIN media_uploaders m ON m.community_id=u.community_id AND m.pubkey=u.agent_owner_pubkey WHERE u.community_id=$1 AND u.pubkey=$2 AND u.deactivated_at IS NULL AND m.sha256=$3)")
-            .bind(community.as_uuid()).bind(agent).bind(hash).fetch_one(&mut *connection).await?)
-    }
-
     /// Resolve an attachment through live references, never a membership cache
     /// or read replica. A repeatable-read snapshot covers both indexed references
     /// and profile fallback, including the absence check for uploader previews.
@@ -92,12 +75,17 @@ impl Db {
         for_publication: bool,
         visible: fn(&nostr::Event, &[u8]) -> bool,
     ) -> Result<MediaAccess> {
+        let _permit = self
+            .media_authorization_slots
+            .try_acquire()
+            .map_err(|_| DbError::InvalidData("media authorization capacity exceeded".into()))?;
         let connection = crate::observability::acquire_writer(
             &self.pool,
             crate::observability::WriterOperation::Authorization,
         )
         .await?;
         let mut tx = sqlx::Transaction::begin(connection, None).await?;
+        let result = async {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await?;
@@ -110,123 +98,66 @@ impl Db {
             return Ok(MediaAccess::Allowed);
         }
 
-        let mut needles = vec![serde_json::json!([["imeta", format!("x {sha256}")]])];
-        let mut bases = vec!["/media".to_owned(), base.trim_end_matches('/').to_owned()];
-        // Both schemes have historically appeared in tenant descriptor URLs.
-        if let Some(rest) = base.strip_prefix("https://") {
-            bases.push(format!("http://{rest}"));
-        }
-        if let Some(rest) = base.strip_prefix("http://") {
-            bases.push(format!("https://{rest}"));
-        }
-        for prefix in bases {
-            for suffix in [
-                String::new(),
-                format!(".{ext}"),
-                ".thumb.jpg".into(),
-                ".thumb.webp".into(),
-            ] {
-                let url = format!("{prefix}/{sha256}{suffix}");
-                for field in ["url", "image"] {
-                    needles.push(serde_json::json!([["imeta", format!("{field} {url}")]]));
-                }
-                needles.push(serde_json::json!([["picture", url]]));
-                needles.push(serde_json::json!([["emoji", url]]));
-            }
-        }
+        let needles = media_reference_needles(sha256, ext, base);
         let mut referenced = false;
         let mut scanned_bytes = 0usize;
-        for probe in 0..3 {
-            let mut query = QueryBuilder::<Postgres>::new(
-                "SELECT e.id,e.pubkey,e.created_at,e.kind,e.tags,e.content,e.sig,e.received_at,e.channel_id, \
-                 (e.deleted_at IS NULL AND (e.channel_id IS NULL OR EXISTS ( \
-                     SELECT 1 FROM channels c WHERE c.community_id=e.community_id AND c.id=e.channel_id \
-                     AND c.deleted_at IS NULL AND (c.visibility='open' OR EXISTS ( \
-                         SELECT 1 FROM channel_members m WHERE m.community_id=c.community_id AND m.channel_id=c.id \
-                         AND m.removed_at IS NULL AND m.pubkey="
-            );
-            query
-                .push_bind(pubkey)
-                .push(
-                    ")))) AND (e.kind <> 40003 OR EXISTS (SELECT 1 FROM events original \
-                WHERE original.community_id=e.community_id AND original.channel_id=e.channel_id \
-                AND original.deleted_at IS NULL AND original.kind IN (9,40002) \
-                AND lower((SELECT tag->>1 FROM jsonb_array_elements(e.tags) WITH ORDINALITY AS t(tag,ord) \
-                    WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1))=encode(original.id,'hex') \
-                AND NOT EXISTS (SELECT 1 FROM events newer \
-                    WHERE newer.community_id=e.community_id AND newer.channel_id=e.channel_id \
-                    AND newer.kind=40003 AND newer.deleted_at IS NULL \
-                    AND (newer.created_at,newer.id) > (e.created_at,e.id) \
-                    AND lower((SELECT tag->>1 FROM jsonb_array_elements(newer.tags) WITH ORDINALITY AS t(tag,ord) \
-                    WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1))=encode(original.id,'hex')))) \
-                AND (e.kind NOT IN (9,40002) OR NOT EXISTS (SELECT 1 FROM events edit \
-                    WHERE edit.community_id=e.community_id AND edit.channel_id=e.channel_id \
-                    AND edit.kind=40003 AND edit.deleted_at IS NULL \
-                    AND lower((SELECT tag->>1 FROM jsonb_array_elements(edit.tags) WITH ORDINALITY AS t(tag,ord) \
-                    WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1))=encode(e.id,'hex')))) AS readable \
-                FROM events e WHERE e.community_id=",
-                )
-                .push_bind(community.as_uuid());
-            if probe == 2 {
-                // Never scan message bodies. Only profiles have content references;
-                // current profiles are indexed by community/kind/deleted_at.
-                query
-                    .push(" AND e.kind=0 AND e.deleted_at IS NULL AND (strpos(e.content, ")
-                    .push_bind(sha256)
-                    .push(") > 0 OR strpos(e.content, E'\\\\u') > 0)");
-            } else {
-                query.push(" AND (");
-                for (i, needle) in (if probe == 0 {
-                    &needles[..1]
-                } else {
-                    &needles[1..]
-                })
-                .iter()
-                .enumerate()
-                {
-                    if i > 0 {
-                        query.push(" OR ");
+        // Prefer readable live references before counting any inaccessible rows.
+        // The second pass only classifies absence; it can stop at the first real reference.
+        for readable_only in [true, false] {
+            for probe in 0..3 {
+                let mut query = media_reference_query(
+                    community,
+                    sha256,
+                    pubkey,
+                    &needles,
+                    probe,
+                    readable_only,
+                );
+                // Stream candidates: a frequently shared hash must not allocate
+                // 1,025 full message bodies before finding the first readable one.
+                let statement = query.build();
+                let mut rows = statement.fetch(&mut *tx);
+                let mut count = 0;
+                while let Some(row) = rows.try_next().await? {
+                    count += 1;
+                    let content: &str = row.try_get("content")?;
+                    let tags: serde_json::Value = row.try_get("tags")?;
+                    scanned_bytes = scanned_bytes
+                        .saturating_add(content.len())
+                        .saturating_add(tags.to_string().len());
+                    if count > 1024 || scanned_bytes > 16 * 1024 * 1024 {
+                        return Err(DbError::InvalidData(
+                            "media reference work budget exceeded".into(),
+                        ));
                     }
-                    query.push("e.tags @> ").push_bind(needle);
+                    let readable: bool = row.try_get("readable")?;
+                    let stored = crate::event::row_to_stored_event(row)?.ok_or_else(|| {
+                        DbError::InvalidData("malformed media reference event".into())
+                    })?;
+                    let event = &stored.event;
+                    if !reference_hashes(event, base).contains(sha256) {
+                        continue;
+                    }
+                    referenced = true;
+                    if !readable_only {
+                        break;
+                    }
+                    let kind = event.kind.as_u16() as u32;
+                    let tagged = event.tags.iter().any(|tag| matches!(tag.as_slice(), [name, value, ..] if name == "p" && value == &hex::encode(pubkey)));
+                    let private_ok = (!kind::P_GATED_KINDS.contains(&kind) || tagged)
+                        && (kind != kind::KIND_AGENT_ENGRAM
+                            || event.pubkey.as_bytes() == pubkey
+                            || tagged);
+                    if readable && private_ok && visible(event, pubkey) {
+                        return Ok(MediaAccess::Allowed);
+                    }
                 }
-                query.push(")");
+                if referenced && !readable_only {
+                    break;
+                }
             }
-            query.push(" LIMIT 1025");
-            // Stream candidates: a frequently shared hash must not allocate
-            // 1,025 full message bodies before finding the first readable one.
-            let statement = query.build();
-            let mut rows = statement.fetch(&mut *tx);
-            let mut count = 0;
-            while let Some(row) = rows.try_next().await? {
-                count += 1;
-                let content: &str = row.try_get("content")?;
-                let tags: serde_json::Value = row.try_get("tags")?;
-                scanned_bytes = scanned_bytes
-                    .saturating_add(content.len())
-                    .saturating_add(tags.to_string().len());
-                if count > 1024 || scanned_bytes > 16 * 1024 * 1024 {
-                    return Err(DbError::InvalidData(
-                        "media reference work budget exceeded".into(),
-                    ));
-                }
-                let readable: bool = row.try_get("readable")?;
-                let stored = crate::event::row_to_stored_event(row)?.ok_or_else(|| {
-                    DbError::InvalidData("malformed media reference event".into())
-                })?;
-                let event = &stored.event;
-                if !reference_hashes(event, base).contains(sha256) {
-                    continue;
-                }
-                referenced = true;
-                let kind = event.kind.as_u16() as u32;
-                let tagged = event.tags.iter().any(|tag| matches!(tag.as_slice(), [name, value, ..] if name == "p" && value == &hex::encode(pubkey)));
-                let private_ok = (!kind::P_GATED_KINDS.contains(&kind) || tagged)
-                    && (kind != kind::KIND_AGENT_ENGRAM
-                        || event.pubkey.as_bytes() == pubkey
-                        || tagged);
-                if readable && private_ok && visible(event, pubkey) {
-                    return Ok(MediaAccess::Allowed);
-                }
+            if referenced && !readable_only {
+                break;
             }
         }
         // Community icons are current community state; commands validate their
@@ -257,5 +188,168 @@ impl Db {
         } else {
             Ok(MediaAccess::NoReference)
         }
+        }.await;
+        // Dropping a streaming lookup queues rollback asynchronously. Await it
+        // while the permit is held so response completion cannot free capacity
+        // while the writer is still draining the query/transaction.
+        tx.rollback().await?;
+        result
     }
+}
+
+pub(super) fn media_reference_query(
+    community: CommunityId,
+    sha256: &str,
+    pubkey: &[u8],
+    needles: &[serde_json::Value],
+    probe: usize,
+    readable_only: bool,
+) -> QueryBuilder<Postgres> {
+    // Parse each live edit target once per statement. A correlated JSON scan
+    // for every attachment candidate amplifies popular-channel edit histories.
+    let mut query = QueryBuilder::<Postgres>::new(
+        "WITH media_edits AS MATERIALIZED (SELECT id,channel_id,created_at, \
+         decode((SELECT tag->>1 FROM jsonb_array_elements(tags) WITH ORDINALITY AS t(tag,ord) \
+         WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1),'hex') AS target \
+         FROM events WHERE community_id=",
+    );
+    query
+        .push_bind(*community.as_uuid())
+        .push(" AND kind=40003 AND deleted_at IS NULL) ");
+    query.push("SELECT id,pubkey,created_at,kind,tags,content,sig,received_at,channel_id,");
+    query.push(if readable_only { "true" } else { "false" });
+    query.push(" AS readable FROM (");
+    query.push(
+                "SELECT e.id,e.pubkey,e.created_at,e.kind,e.tags,e.content,e.sig,e.received_at,e.channel_id, \
+                 (e.deleted_at IS NULL AND (e.channel_id IS NULL OR EXISTS ( \
+                     SELECT 1 FROM channels c WHERE c.community_id=e.community_id AND c.id=e.channel_id \
+                     AND c.deleted_at IS NULL AND (c.visibility='open' OR EXISTS ( \
+                         SELECT 1 FROM channel_members m WHERE m.community_id=c.community_id AND m.channel_id=c.id \
+                         AND m.removed_at IS NULL AND m.pubkey="
+            );
+    query
+                .push_bind(pubkey)
+                .push(
+                    ")))) AND (e.kind <> 40003 OR EXISTS (SELECT 1 FROM events original \
+                WHERE original.community_id=e.community_id AND original.channel_id=e.channel_id \
+                AND original.deleted_at IS NULL AND original.kind IN (9,40002) \
+                AND lower((SELECT tag->>1 FROM jsonb_array_elements(e.tags) WITH ORDINALITY AS t(tag,ord) \
+                    WHERE tag->>0='e' AND tag->>1 ~ '^[0-9A-Fa-f]{64}$' ORDER BY ord LIMIT 1))=encode(original.id,'hex') \
+                AND NOT EXISTS (SELECT 1 FROM media_edits newer \
+                    WHERE newer.channel_id=e.channel_id \
+                    AND (newer.created_at,newer.id) > (e.created_at,e.id) \
+                    AND newer.target=original.id))) \
+                AND (e.kind NOT IN (9,40002) OR NOT EXISTS (SELECT 1 FROM media_edits edit \
+                    WHERE edit.channel_id=e.channel_id \
+                    AND edit.target=e.id))) AS readable \
+                FROM events e WHERE e.community_id=",
+                )
+                .push_bind(*community.as_uuid()).push(" AND e.deleted_at IS NULL");
+    if probe == 2 {
+        // Never scan message bodies. Only profiles have content references;
+        // current profiles are indexed by community/kind/deleted_at.
+        query
+            .push(" AND e.kind=0 AND e.deleted_at IS NULL AND (strpos(e.content, ")
+            .push_bind(sha256)
+            .push(") > 0 OR strpos(e.content, E'\\\\u') > 0)");
+    } else {
+        query.push(" AND (");
+        for (i, needle) in (if probe == 0 {
+            &needles[..1]
+        } else {
+            &needles[1..]
+        })
+        .iter()
+        .enumerate()
+        {
+            if i > 0 {
+                query.push(" OR ");
+            }
+            query.push("(");
+            let tag = needle[0][0].as_str().unwrap_or("");
+            if tag == "picture" {
+                query.push("e.kind=39000 AND ");
+            }
+            if tag == "emoji" {
+                query.push("e.kind IN (10030,30030) AND ");
+            }
+            query.push("e.tags @> ").push_bind(needle).push(")");
+        }
+        query.push(")");
+    }
+    query.push(") candidate");
+    if readable_only {
+        query.push(" WHERE readable");
+        // Match the ordinary visibility classes before budgeting candidates.
+        // The relay predicate still performs its authoritative final check.
+        let gated: Vec<i32> = kind::P_GATED_KINDS
+            .iter()
+            .chain(kind::RESULT_GATED_KINDS)
+            .map(|kind| *kind as i32)
+            .collect();
+        let author_only: Vec<i32> = kind::AUTHOR_ONLY_KINDS
+            .iter()
+            .map(|kind| *kind as i32)
+            .collect();
+        let shared: Vec<i32> = kind::SHARED_GATED_KINDS
+            .iter()
+            .map(|kind| *kind as i32)
+            .collect();
+        query
+            .push(" AND (kind <> ALL(")
+            .push_bind(gated)
+            .push(") OR tags @> ")
+            .push_bind(serde_json::json!([["p", hex::encode(pubkey)]]))
+            .push(")");
+        query
+            .push(" AND (kind <> ALL(")
+            .push_bind(author_only)
+            .push(") OR pubkey=")
+            .push_bind(pubkey)
+            .push(")");
+        query
+            .push(" AND (kind <> ")
+            .push_bind(kind::KIND_AGENT_ENGRAM as i32)
+            .push(" OR pubkey=")
+            .push_bind(pubkey)
+            .push(" OR tags @> ")
+            .push_bind(serde_json::json!([["p", hex::encode(pubkey)]]))
+            .push(")");
+        query.push(" AND (kind <> ALL(").push_bind(shared).push(") OR pubkey=").push_bind(pubkey)
+            .push(" OR jsonb_path_query_array(tags, '$[*] ? (@[0] == \"shared\")') = '[[\"shared\",\"true\"]]'::jsonb)");
+    }
+    query.push(" LIMIT 1025");
+    query
+}
+
+pub(super) fn media_reference_needles(
+    sha256: &str,
+    ext: &str,
+    base: &str,
+) -> Vec<serde_json::Value> {
+    let mut needles = vec![serde_json::json!([["imeta", format!("x {sha256}")]])];
+    let mut bases = vec!["/media".to_owned(), base.trim_end_matches('/').to_owned()];
+    // Both schemes have historically appeared in tenant descriptor URLs.
+    if let Some(rest) = base.strip_prefix("https://") {
+        bases.push(format!("http://{rest}"));
+    }
+    if let Some(rest) = base.strip_prefix("http://") {
+        bases.push(format!("https://{rest}"));
+    }
+    for prefix in bases {
+        for suffix in [
+            String::new(),
+            format!(".{ext}"),
+            ".thumb.jpg".into(),
+            ".thumb.webp".into(),
+        ] {
+            let url = format!("{prefix}/{sha256}{suffix}");
+            for field in ["url", "image"] {
+                needles.push(serde_json::json!([["imeta", format!("{field} {url}")]]));
+            }
+            needles.push(serde_json::json!([["picture", url]]));
+            needles.push(serde_json::json!([["emoji", url]]));
+        }
+    }
+    needles
 }
