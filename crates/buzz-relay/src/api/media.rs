@@ -90,7 +90,7 @@ enum UploadRouteMode {
 ///
 /// Non-Blossom errors (`blossom_denial_kind()` returns `None`) always fall
 /// through to `MediaError::into_response()` regardless of mode.
-pub(crate) struct MediaDenial(MediaError, BlossomStrictness);
+pub(crate) struct MediaDenial(pub(super) MediaError, pub(super) BlossomStrictness);
 
 impl IntoResponse for MediaDenial {
     fn into_response(self) -> Response {
@@ -112,7 +112,8 @@ impl IntoResponse for MediaDenial {
                 );
                 let mut builder = axum::http::Response::builder()
                     .status(class.http_status())
-                    .header(header::CONTENT_TYPE, class.content_type());
+                    .header(header::CONTENT_TYPE, class.content_type())
+                    .header(header::CACHE_CONTROL, "private, no-store");
                 if let Some(challenge) = class.www_authenticate() {
                     builder = builder.header("WWW-Authenticate", challenge);
                 }
@@ -121,7 +122,12 @@ impl IntoResponse for MediaDenial {
                     .expect("NIP-FI denial response is always valid");
             }
         }
-        error.into_response()
+        let mut response = error.into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        response
     }
 }
 
@@ -609,6 +615,50 @@ async fn upload_blob_result(
         // get the same NIP-FI shape as pre-body ones.
         .map_err(|e| media_denial(e, strictness))?;
 
+    if state.config.media_read_mode != super::media_access::MediaReadMode::Off {
+        // A reupload of a legacy attachment must remember that it has been
+        // published before recording new preview authority. Otherwise purging
+        // the legacy source later could resurrect uploader preview access.
+        let base = media_base_url_for_tenant(&state.config.relay_url, auth.tenant.host());
+        let ext = descriptor
+            .url
+            .rsplit('.')
+            .next()
+            .ok_or_else(|| media_denial(MediaError::Internal, strictness))?;
+        let existing = state
+            .db
+            .media_access(
+                auth.tenant.community(),
+                &descriptor.sha256,
+                ext,
+                &base,
+                auth.auth_event.pubkey.as_bytes(),
+                false,
+                crate::handlers::req::event_visible_to_reader,
+            )
+            .await
+            .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+        if matches!(
+            existing,
+            buzz_db::media::MediaAccess::Allowed | buzz_db::media::MediaAccess::Restricted
+        ) {
+            state
+                .db
+                .record_media_publications(auth.tenant.community(), vec![descriptor.sha256.clone()])
+                .await
+                .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+        }
+        state
+            .db
+            .record_media_upload(
+                auth.tenant.community(),
+                &descriptor.sha256,
+                auth.auth_event.pubkey.as_bytes(),
+            )
+            .await
+            .map_err(|_| media_denial(MediaError::AuthorizationUnavailable, strictness))?;
+    }
+
     rewrite_descriptor_urls_for_tenant(
         &mut descriptor,
         &state.config.relay_url,
@@ -757,7 +807,7 @@ async fn enforce_blossom_read_membership(
 }
 
 fn blob_cache_control() -> &'static str {
-    "private, max-age=31536000, immutable"
+    "private, no-store"
 }
 
 /// Whether a path-segment extension is a safe token.
@@ -906,6 +956,14 @@ pub(crate) async fn get_blob(
         &req_headers,
         strictness,
         &slot,
+    )
+    .await?;
+    super::media_access::enforce_read(
+        &state,
+        &tenant,
+        &sha256_ext,
+        auth_event.pubkey.as_bytes(),
+        strictness,
     )
     .await?;
     serve_blob_for_tenant(&state, &tenant, &sha256_ext, &req_headers)
@@ -1226,6 +1284,14 @@ pub(crate) async fn head_blob(
         &headers,
         strictness,
         &slot,
+    )
+    .await?;
+    super::media_access::enforce_read(
+        &state,
+        &tenant,
+        &sha256_ext,
+        auth_event.pubkey.as_bytes(),
+        strictness,
     )
     .await?;
     let cache_control = blob_cache_control();
