@@ -225,6 +225,37 @@ async fn two_communities_add_edit_restart_keeps_local_images_and_fixed_agent_sig
     }
     let path = projected.split("/media/").nth(1).unwrap();
     assert_eq!(a.state.data.lock().unwrap().blobs[path], image(2));
+    // Animated profiles localize both assets, and retain both projections after
+    // the source community is removed without authenticating back to it.
+    let poster = seed(&b, image(6));
+    let animation = seed(&b, image(7));
+    let descriptor = format!(
+        "{poster}#buzz-anim={}",
+        percent_encoding::utf8_percent_encode(&animation, percent_encoding::NON_ALPHANUMERIC)
+    );
+    sync(&state, &a, &keys, &descriptor).await.unwrap();
+    let (projected_poster, projected_animation) =
+        buzz_core_pkg::media::animated_avatar_urls(&picture(&a)).unwrap();
+    assert_eq!(
+        projected_poster,
+        poster.replace(&b.state.base, &a.state.base)
+    );
+    assert_eq!(
+        projected_animation,
+        animation.replace(&b.state.base, &a.state.base)
+    );
+    for (value, bytes) in [
+        (projected_poster, image(6)),
+        (projected_animation, image(7)),
+    ] {
+        let path = value.split("/media/").nth(1).unwrap();
+        assert_eq!(a.state.data.lock().unwrap().blobs[path], bytes);
+    }
+    let source_requests = b.state.data.lock().unwrap().requests.len();
+    b.state.data.lock().unwrap().blobs.clear();
+    *state.agent_avatar_communities.lock().unwrap() = vec![a.state.base.clone()];
+    sync(&state, &a, &keys, &descriptor).await.unwrap();
+    assert_eq!(b.state.data.lock().unwrap().requests.len(), source_requests);
 }
 
 #[tokio::test]

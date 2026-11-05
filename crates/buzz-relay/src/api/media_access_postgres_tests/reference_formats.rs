@@ -51,6 +51,33 @@ pub(super) async fn run(
                 .is_err(),
             "copied {format}"
         );
+        if format == "animated" {
+            let request = Request::builder()
+                .method("PUT")
+                .uri("/upload")
+                .header(header::HOST, host)
+                .header(
+                    header::AUTHORIZATION,
+                    proof(member, host, image_hash, "upload"),
+                )
+                .header("X-SHA-256", image_hash)
+                .body(Body::from("animated asset 0"))
+                .unwrap();
+            assert_eq!(
+                router(state.clone())
+                    .oneshot(request)
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+            assert!(
+                crate::handlers::media_access::validate_media_references(tenant, state, &copied)
+                    .await
+                    .is_err(),
+                "owning only the poster cannot publish the private animation"
+            );
+        }
         let event = EventBuilder::new(kind, content)
             .tags(tags)
             .custom_created_at(Timestamp::from(
