@@ -10,11 +10,17 @@ pub(super) async fn run(
     survivor: &Keys,
     channel: Uuid,
 ) {
+    let images: [&[u8]; 2] = [
+        include_bytes!("../../../../buzz-media/tests/fixtures/ios/uikit-sanitized.png"),
+        include_bytes!(
+            "../../../../buzz-media/tests/fixtures/android/sanitized/bitmap-srgb-sanitized.png"
+        ),
+    ];
     for (index, format) in ["snapshot", "animated", "image"].into_iter().enumerate() {
         let mut assets = Vec::new();
         for asset in 0..2 {
-            let bytes = format!("{format} asset {asset}");
-            let hash = hex::encode(Sha256::digest(bytes.as_bytes()));
+            let bytes = images[asset];
+            let hash = hex::encode(Sha256::digest(bytes));
             let request = Request::builder()
                 .method("PUT")
                 .uri("/upload")
@@ -33,7 +39,7 @@ pub(super) async fn run(
             unreachable!()
         };
         let (kind,content,tags) = match format {
-            "snapshot" => (Kind::Custom(9),String::new(),vec![
+            "snapshot" => (Kind::Custom(9),"https://example.com/page".to_owned(),vec![
                 Tag::parse(["h",&channel.to_string()]).unwrap(),
                 Tag::parse(["link-preview","snapshot","1","https://example.com/page","title","site","description",image,image_hash,favicon,favicon_hash]).unwrap(),
             ]),
@@ -61,7 +67,7 @@ pub(super) async fn run(
                     proof(member, host, image_hash, "upload"),
                 )
                 .header("X-SHA-256", image_hash)
-                .body(Body::from("animated asset 0"))
+                .body(Body::from(images[0]))
                 .unwrap();
             assert_eq!(
                 router(state.clone())
