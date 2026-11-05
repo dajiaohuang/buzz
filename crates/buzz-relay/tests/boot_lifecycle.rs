@@ -646,7 +646,7 @@ mod postgres_tests {
             .execute(&mut *startup_hold)
             .await
             .unwrap();
-        let mut process = RelayProcess::spawn(&[
+        let mut process = spawn_shadow(&[
             ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
             ("DATABASE_URL", &database_url),
             ("REDIS_URL", &redis_url),
@@ -884,7 +884,7 @@ mod postgres_tests {
         let health = reserve_closed_port();
         let health_value = health.to_string();
         let bind = format!("127.0.0.1:{}", reserve_closed_port());
-        let mut process = RelayProcess::spawn(&[
+        let mut process = spawn_shadow(&[
             ("BUZZ_RELAY_PRIVATE_KEY", VALID_RELAY_PRIVATE_KEY),
             ("DATABASE_URL", &database_url),
             ("REDIS_URL", &redis_url),
@@ -1341,6 +1341,20 @@ mod postgres_tests {
     /// of `community_nip_fi_issuers`.
     const NIP_FI_PROVISION_BINDING: &str = r#"{"host_suffix":"communities.example.com","authorized_issuers":["https://idp.example.com"]}"#;
 
+    // RelayProcess clears its environment. Every evaluating boot needs the
+    // complete FI configuration before it can reach activation registration.
+    fn spawn_shadow(extra: &[(&str, &str)]) -> RelayProcess {
+        let mut environment = vec![
+            ("BUZZ_NIP_FI_MODE", "shadow"),
+            ("BUZZ_NIP_FI_COMMUNITY_SOURCE", "database"),
+            ("BUZZ_NIP_FI_ISSUERS", NIP_FI_ISSUERS),
+            ("BUZZ_NIP_FI_PROVISION_BINDING", NIP_FI_PROVISION_BINDING),
+            ("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600"),
+        ];
+        environment.extend_from_slice(extra);
+        RelayProcess::spawn(&environment)
+    }
+
     /// Boots the relay with the database community source; `extra` adds or
     /// overrides variables. Returns the health port alongside the process.
     fn spawn_database_source(extra: &[(&str, &str)]) -> (RelayProcess, u16) {
@@ -1360,15 +1374,9 @@ mod postgres_tests {
             ("DATABASE_URL", database_url.as_str()),
             ("REDIS_URL", redis_url.as_str()),
             ("BUZZ_GIT_CONFORMANCE_PROBE", "false"),
-            // Shadow: off builds no resolver, so it loads no snapshot.
-            ("BUZZ_NIP_FI_MODE", "shadow"),
-            ("BUZZ_NIP_FI_COMMUNITY_SOURCE", "database"),
-            ("BUZZ_NIP_FI_ISSUERS", NIP_FI_ISSUERS),
-            ("BUZZ_NIP_FI_PROVISION_BINDING", NIP_FI_PROVISION_BINDING),
-            ("BUZZ_NIP_FI_MAX_CONNECTION_LIFETIME_SECS", "3600"),
         ];
         environment.extend_from_slice(extra);
-        (RelayProcess::spawn(&environment), health_port)
+        (spawn_shadow(&environment), health_port)
     }
 
     /// Binds `count` active communities under the provision suffix to the
