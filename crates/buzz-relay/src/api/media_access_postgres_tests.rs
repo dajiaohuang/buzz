@@ -175,7 +175,7 @@ async fn post(
     .await
 }
 
-mod reference_formats;
+mod reference_formats_postgres_tests;
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
@@ -740,7 +740,10 @@ async fn private_media_revocation_http_journey() {
         StatusCode::OK,
         "legacy URL-only share"
     );
-    reference_formats::run(&state, &tenant, &host, &owner, &member, &survivor, channel).await;
+    reference_formats_postgres_tests::run(
+        &state, &tenant, &host, &owner, &member, &survivor, channel,
+    )
+    .await;
     // Every event kind has bounded publication work; shadow still accepts.
     let mut emoji_tags = vec![Tag::parse(["d", "large"]).unwrap()];
     for n in 1000..1513 {
