@@ -477,7 +477,67 @@ async fn media_reference_full_query_plans() {
             }
         }
     }
-    tx.rollback().await.unwrap();
+    // The isolation wrapper owns this database. Commit the fixture so a fresh
+    // production Db handle can read it, with server-side JIT enabled by default.
+    tx.commit().await.unwrap();
+    let production_pool = sqlx::postgres::PgPoolOptions::new().max_connections(1)
+        .after_connect(|connection,_| Box::pin(async move {
+            sqlx::raw_sql("SET search_path=media_access_plan,public; SET jit=on; SET statement_timeout='2s'")
+                .execute(connection).await?;
+            Ok(())
+        }))
+        .connect(&crate::test_support::database_url()).await.unwrap();
+    let channel: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM media_access_plan.channels WHERE visibility='open' LIMIT 1",
+    )
+    .fetch_one(&production_pool)
+    .await
+    .unwrap();
+    let url_hash = "b".repeat(64);
+    let event = EventBuilder::new(Kind::Custom(9), "URL-only legacy attachment")
+        .tags([
+            Tag::parse(["h", &channel.to_string()]).unwrap(),
+            Tag::parse([
+                "imeta",
+                &format!("url https://plan.example/media/{url_hash}.bin"),
+            ])
+            .unwrap(),
+        ])
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+    sqlx::query("INSERT INTO media_access_plan.events(community_id,id,pubkey,created_at,kind,tags,content,sig,channel_id) VALUES($1,$2,$3,$4,9,$5,$6,$7,$8)")
+        .bind(community.as_uuid()).bind(event.id.as_bytes().as_slice()).bind(event.pubkey.to_bytes().as_slice())
+        .bind(chrono::DateTime::from_timestamp(event.created_at.as_secs() as i64,0).unwrap())
+        .bind(serde_json::to_value(&event.tags).unwrap()).bind(&event.content)
+        .bind(event.sig.serialize().as_slice()).bind(channel).execute(&production_pool).await.unwrap();
+    let db = Db::from_pool(production_pool.clone());
+    let production_started = std::time::Instant::now();
+    let access = db
+        .media_access(
+            community,
+            &url_hash,
+            "bin",
+            "https://plan.example/media",
+            &reader,
+            false,
+            |_, _| true,
+        )
+        .await
+        .expect("production URL-only lookup must apply the bounded non-JIT policy");
+    println!(
+        "PRODUCTION_URL_ONLY_LOOKUP_MS: {}",
+        production_started.elapsed().as_secs_f64() * 1000.0
+    );
+    assert_eq!(access, MediaAccess::Allowed);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SHOW jit")
+            .fetch_one(&production_pool)
+            .await
+            .unwrap(),
+        "on",
+        "lookup rollback must restore the pooled connection's JIT setting"
+    );
+    production_pool.close().await;
 }
 
 /// Compare the production Rust target rule to SQL, the catalog and new partitions.
