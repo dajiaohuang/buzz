@@ -523,7 +523,9 @@ async fn migration_schema_listed_name_index_needs_the_renames_then_builds_inline
     seed.open(&pool, newer, "Square-iOS", 10).await;
     let before = seed.names(&pool).await;
 
-    let error = migration::run_migrations(&pool).await.unwrap_err();
+    let error = migration::run_migrations_through(&pool, BEFORE_INDEX + 1)
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("duplicate names remain"),
         "must name the duplicate rows, not merely fail: {error}"
@@ -542,7 +544,9 @@ async fn migration_schema_listed_name_index_needs_the_renames_then_builds_inline
         .execute(&mut *writer)
         .await
         .unwrap();
-    let error = migration::run_migrations(&pool).await.unwrap_err();
+    let error = migration::run_migrations_through(&pool, BEFORE_INDEX + 1)
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("lock timeout"),
         "the build must not queue behind a writer: {error}"
@@ -553,7 +557,7 @@ async fn migration_schema_listed_name_index_needs_the_renames_then_builds_inline
 
     // With no writer in the way, the populated table migrates with no
     // operator step: the migration builds the index itself.
-    migration::run_migrations(&pool)
+    migration::run_migrations_through(&pool, BEFORE_INDEX + 1)
         .await
         .expect("migrate a populated table after the renames");
     assert_eq!(ledger_version(&pool).await, BEFORE_INDEX + 1);
@@ -605,7 +609,9 @@ async fn migration_schema_listed_name_index_validates_a_prebuild() {
             .execute(&pool)
             .await
             .unwrap();
-        let error = migration::run_migrations(&pool).await.unwrap_err();
+        let error = migration::run_migrations_through(&pool, BEFORE_INDEX + 1)
+            .await
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -629,7 +635,7 @@ async fn migration_schema_listed_name_index_validates_a_prebuild() {
         .execute(&mut *writer)
         .await
         .unwrap();
-    migration::run_migrations(&pool)
+    migration::run_migrations_through(&pool, BEFORE_INDEX + 1)
         .await
         .expect("accept the prebuild without waiting for channel writers");
     writer.rollback().await.unwrap();
