@@ -267,7 +267,7 @@ pub(super) fn media_reference_query(
             .push(" AND e.kind=0 AND e.deleted_at IS NULL AND (strpos(e.content, ")
             .push_bind(sha256)
             .push(
-                ") > 0 OR strpos(e.content, E'\\\\u') > 0 OR strpos(e.content, '#buzz-anim=') > 0)",
+                ") > 0 OR strpos(e.content, '#buzz-anim=') > 0 OR strpos(e.content, E'\\\\u') > 0)",
             );
     } else {
         query.push(" AND (");
@@ -295,10 +295,28 @@ pub(super) fn media_reference_query(
             if tag == "emoji" {
                 query.push("e.kind IN (10030,30030) AND ");
             }
+            let preview_urls = (tag == "link-preview").then(|| {
+                matching
+                    .iter()
+                    .filter_map(|needle| needle[0][1].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            });
             query
                 .push("e.tags @> ANY(")
                 .push_bind(matching)
-                .push("::jsonb[]))");
+                .push("::jsonb[])");
+            if let Some(urls) = preview_urls {
+                // Containment ignores array positions. Recheck the actual
+                // snapshot fields before non-counting rows consume the budget.
+                query.push(" AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) AS preview(value) \
+                    WHERE preview.value->>0='link-preview' AND preview.value->>1='snapshot' \
+                    AND preview.value->>2='1' AND CASE WHEN jsonb_typeof(preview.value)='array' \
+                    THEN jsonb_array_length(preview.value)=11 ELSE false END \
+                    AND (preview.value->>7 = ANY(")
+                    .push_bind(urls.clone()).push("::text[]) OR preview.value->>9 = ANY(")
+                    .push_bind(urls).push("::text[])))");
+            }
+            query.push(")");
         }
         query.push(")");
     }

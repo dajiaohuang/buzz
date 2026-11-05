@@ -308,6 +308,64 @@ async fn popular_media_prefers_live_readable_references_and_bounds_work() {
         allowed(&db, community, &shared_hash, &base, &reader).await,
         MediaAccess::Allowed
     );
+    // Page-position preview URLs never count, even when they fill a whole
+    // older partition before the real image-position reference.
+    let open = db
+        .create_channel(
+            community,
+            "preview-decoys",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            owner.public_key().as_bytes(),
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    let snapshot_hash = "f".repeat(64);
+    let snapshot_url = format!("{base}/{snapshot_hash}.png");
+    sqlx::query("INSERT INTO events(community_id,id,pubkey,created_at,kind,tags,content,sig,channel_id) SELECT $1,decode(lpad(to_hex(n),64,'0'),'hex'),$2,'2025-01-01'::timestamptz,9,$3,$4,decode(repeat('00',64),'hex'),$5 FROM generate_series(6000,7024) n")
+        .bind(community.as_uuid()).bind(owner.public_key().as_bytes().as_slice())
+        .bind(serde_json::json!([["h",open.to_string()],["link-preview","snapshot","1",snapshot_url,"title","site","description","","","",""]]))
+        .bind(&snapshot_url).bind(open).execute(db.pool()).await.unwrap();
+    let snapshot = EventBuilder::new(Kind::Custom(9), "https://page.example/")
+        .tags([
+            Tag::parse(["h", &channel.to_string()]).unwrap(),
+            Tag::parse([
+                "link-preview",
+                "snapshot",
+                "1",
+                "https://page.example/",
+                "title",
+                "site",
+                "description",
+                &snapshot_url,
+                &snapshot_hash,
+                "",
+                "",
+            ])
+            .unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    db.insert_event(community, &snapshot, Some(channel))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.media_access(
+            community,
+            &snapshot_hash,
+            "png",
+            &base,
+            owner.public_key().as_bytes(),
+            false,
+            |_, _| true
+        )
+        .await
+        .expect("page-position decoys must not exhaust the image-reference budget"),
+        MediaAccess::Allowed
+    );
     // An oversized readable row must fail closed without buffering all candidates.
     let huge_hash = "e".repeat(64);
     let huge = EventBuilder::new(Kind::Custom(1), "z".repeat(16 * 1024 * 1024 + 1))
