@@ -1,4 +1,4 @@
--- Run in psql, outside a transaction, before deploying migration 0084.
+-- Run in psql, outside a transaction, before deploying migration 0085.
 -- Let PostgreSQL generate child names, matching desired-state partition indexes.
 \set ON_ERROR_STOP on
 SET lock_timeout = '1s';
@@ -35,5 +35,5 @@ ORDER BY c.oid
 \gexec
 -- Validate using the exact same bounded guard as startup (no table build here).
 BEGIN;
-\ir ../../migrations/0084_media_edit_target.sql
+\ir ../../migrations/0085_media_edit_target.sql
 COMMIT;

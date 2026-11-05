@@ -1,6 +1,6 @@
 # Media edit target index deployment
 
-Before deploying migration 0084, applying desired-state schema to an existing
+Before deploying migration 0085, applying desired-state schema to an existing
 database, or enabling shadow, prebuild the partial btree
 on the normalized first valid edit target. Signed event tags are never rewritten.
 The immutable built-in JSONPath expression preserves tag order and hex casing.
@@ -30,9 +30,9 @@ outside a transaction, and rerun. Do not drop valid attached indexes or replace
 concurrent builds with a blocking build. Wrong definitions fail attachment or
 migration verification and need operator correction before proceeding.
 
-Migration 0084 builds directly only on an empty events table. Populated databases
+Migration 0085 builds directly only on an empty events table. Populated databases
 without the prebuilt index fail startup with an explicit prebuild instruction.
-With auto-migration disabled, operators must apply and verify 0084 before deploying
+With auto-migration disabled, operators must apply and verify 0085 before deploying
 this binary, even in off mode. Bypassing that ordering and enabling enforce can
 cause lookup timeouts and authorization-unavailable responses; restore off and
 complete prebuild/verification before shadow. Do not use that bypass as a soak.
@@ -42,4 +42,4 @@ the new index, which adds only normal index maintenance. No row backfill, trigge
 function or foreign key is added. New and old binaries may serve against the
 expanded schema. Keep auto-migration disabled on old binaries/restarts/rollback
 because sqlx rejects unknown migration versions. Do not run community deletion
-between 0083's table expansion and the new binary's deletion-catalog deployment.
+between 0084's table expansion and the new binary's deletion-catalog deployment.

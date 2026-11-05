@@ -778,7 +778,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 84);
+        assert_eq!(migrations.len(), 85);
         for (index, migration) in migrations.iter().enumerate() {
             assert_eq!(migration.version, (index + 1) as i64);
         }
@@ -786,6 +786,18 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("ADD COLUMN auto_join BOOLEAN NOT NULL DEFAULT false"));
+        // Listed channel names (0083): a bounded contract index that refuses
+        // to build over unrepaired duplicates. The desired schema carries the
+        // same plain index.
+        assert_eq!(migrations[82].version, 83);
+        let listed_names = strip_sql_comments(migrations[82].sql.as_str());
+        assert!(listed_names.contains("SET LOCAL lock_timeout = '1s';"));
+        assert!(listed_names.contains("SET LOCAL statement_timeout = '5s';"));
+        assert!(listed_names.contains("CREATE UNIQUE INDEX idx_channels_listed_name"));
+        assert!(!listed_names.contains("CONCURRENTLY"));
+        assert!(crate::test_support::desired_state_schema_sql().contains(
+            "CREATE UNIQUE INDEX idx_channels_listed_name ON channels (community_id, lower(name))"
+        ));
         assert!(migrations[70]
             .sql
             .as_str()
@@ -2934,6 +2946,21 @@ mod postgres_tests {
             "column parity mismatch for channels: schema.sql desired state has drifted \
              from the migrations; update schema/tables/public/channels.sql to match"
         );
+        // The listed-name index (0083) is compared on its own for that reason.
+        let listed_name = |shapes: Vec<(String, String, String)>| {
+            shapes
+                .into_iter()
+                .filter(|(name, _, _)| name == "idx_channels_listed_name")
+                .collect::<Vec<_>>()
+        };
+        let desired_listed_name = listed_name(index_shapes(&desired, "channels").await);
+        assert_eq!(desired_listed_name.len(), 1, "desired state has the index");
+        assert_eq!(
+            desired_listed_name,
+            listed_name(index_shapes(&migrated, "channels").await),
+            "idx_channels_listed_name parity mismatch: update \
+             schema/tables/public/channels.sql to match migration 0083"
+        );
         assert_eq!(
             events_key_defs(&desired).await,
             events_key_defs(&migrated).await,
@@ -3668,7 +3695,7 @@ mod postgres_tests {
     async fn media_edit_index_upgrade_requires_verified_prebuild() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
-        run_migrations_through(&pool, 83).await.unwrap();
+        run_migrations_through(&pool, 84).await.unwrap();
         let community = uuid::Uuid::new_v4();
         sqlx::query("INSERT INTO communities(id,host) VALUES($1,'media-index-upgrade.example')")
             .bind(community)
