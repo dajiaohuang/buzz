@@ -175,6 +175,106 @@ async fn post(
     .await
 }
 
+// Exercise the client wire formats through real upload, ingest and download paths.
+async fn reference_format_journey(
+    state: &Arc<AppState>,
+    tenant: &buzz_core::TenantContext,
+    host: &str,
+    owner: &Keys,
+    member: &Keys,
+    survivor: &Keys,
+    channel: Uuid,
+) {
+    for (index, format) in ["snapshot", "animated", "image"].into_iter().enumerate() {
+        let mut assets = Vec::new();
+        for asset in 0..2 {
+            let bytes = format!("{format} asset {asset}");
+            let hash = hex::encode(Sha256::digest(bytes.as_bytes()));
+            let request = Request::builder()
+                .method("PUT")
+                .uri("/upload")
+                .header(header::HOST, host)
+                .header(header::AUTHORIZATION, proof(owner, host, &hash, "upload"))
+                .header("X-SHA-256", &hash)
+                .body(Body::from(bytes))
+                .unwrap();
+            let response = router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 100_000).await.unwrap();
+            let descriptor: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assets.push((hash, descriptor["url"].as_str().unwrap().to_owned()));
+        }
+        let [(image_hash, image), (favicon_hash, favicon)] = assets.as_slice() else {
+            unreachable!()
+        };
+        let (kind,content,tags) = match format {
+            "snapshot" => (Kind::Custom(9),String::new(),vec![
+                Tag::parse(["h",&channel.to_string()]).unwrap(),
+                Tag::parse(["link-preview","snapshot","1","https://example.com/page","title","site","description",image,image_hash,favicon,favicon_hash]).unwrap(),
+            ]),
+            "animated" => (Kind::Metadata,serde_json::json!({"picture":format!("{image}#buzz-anim={}",url::form_urlencoded::byte_serialize(favicon.as_bytes()).collect::<String>())}).to_string(),vec![]),
+            _ => (Kind::Metadata,serde_json::json!({"image":image,"banner":favicon}).to_string(),vec![]),
+        };
+        // Owning an account or knowing a descriptor never substitutes for bytes.
+        let copied = EventBuilder::new(kind, &content)
+            .tags(tags.clone())
+            .sign_with_keys(member)
+            .unwrap();
+        assert!(
+            crate::handlers::media_access::validate_media_references(tenant, state, &copied)
+                .await
+                .is_err(),
+            "copied {format}"
+        );
+        let event = EventBuilder::new(kind, content)
+            .tags(tags)
+            .custom_created_at(Timestamp::from(
+                Timestamp::now().as_secs() + 30 + index as u64,
+            ))
+            .sign_with_keys(owner)
+            .unwrap();
+        post(state, tenant, owner, event.clone()).await.unwrap();
+        for (hash, _) in &assets {
+            for keys in [owner, survivor] {
+                let response = router(state.clone())
+                    .oneshot(get(keys, host, hash, hash, "GET", None))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "posted {format}");
+            }
+            let response = router(state.clone())
+                .oneshot(get(member, host, hash, hash, "GET", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if format == "snapshot" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::OK
+                }
+            );
+        }
+        sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1 AND id=$2")
+            .bind(tenant.community().as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .execute(state.db.pool())
+            .await
+            .unwrap();
+        for (hash, _) in &assets {
+            let response = router(state.clone())
+                .oneshot(get(owner, host, hash, hash, "GET", None))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "deleting {format} must not revive uploader preview"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn private_media_revocation_http_journey() {
@@ -295,6 +395,17 @@ async fn private_media_revocation_http_journey() {
         response.headers()[header::CACHE_CONTROL],
         "private, no-store"
     );
+    for range in ["bytes=99999999-", "bytes=invalid"] {
+        let response = router(state.clone())
+            .oneshot(get(&survivor, &host, &hash, &hash, "GET", Some(range)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+    }
     // Model an attachment posted before recording existed. A real reupload
     // must retain its legacy publication boundary even after source purging.
     sqlx::query("DELETE FROM media_publications WHERE community_id=$1 AND sha256=$2")
@@ -727,7 +838,8 @@ async fn private_media_revocation_http_journey() {
         StatusCode::OK,
         "legacy URL-only share"
     );
-    // Large real emoji sets remain editable; shadow never refuses new checks.
+    reference_format_journey(&state, &tenant, &host, &owner, &member, &survivor, channel).await;
+    // Every event kind has bounded publication work; shadow still accepts.
     let mut emoji_tags = vec![Tag::parse(["d", "large"]).unwrap()];
     for n in 1000..1513 {
         let emoji_hash = format!("{n:064x}");
@@ -768,14 +880,36 @@ async fn private_media_revocation_http_journey() {
             .unwrap(),
         );
     }
-    let large_set = EventBuilder::new(Kind::Custom(30030), "")
-        .tags(emoji_tags)
+    let shadow = fixture(&endpoint, super::media_access::MediaReadMode::Shadow).await;
+    for kind in [10030, 30030] {
+        let large_set = EventBuilder::new(Kind::Custom(kind), "")
+            .tags(emoji_tags.clone())
+            .sign_with_keys(&owner)
+            .unwrap();
+        let reads = bucket.reads.load(Ordering::SeqCst);
+        let error =
+            crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error,crate::handlers::ingest::IngestError::Rejected(message) if message.contains("too many attachment"))
+        );
+        assert_eq!(
+            bucket.reads.load(Ordering::SeqCst),
+            reads,
+            "over-limit emoji must stop before sidecar fan-out"
+        );
+        crate::handlers::media_access::validate_media_references(&tenant, &shadow, &large_set)
+            .await
+            .unwrap();
+    }
+    let bounded_set = EventBuilder::new(Kind::Custom(30030), "")
+        .tags(emoji_tags.into_iter().take(513))
         .sign_with_keys(&owner)
         .unwrap();
-    crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
+    crate::handlers::media_access::validate_media_references(&tenant, &state, &bounded_set)
         .await
-        .expect("enforce exempts emoji sets from the 512-reference cap");
-    let shadow = fixture(&endpoint, super::media_access::MediaReadMode::Shadow).await;
+        .expect("512 emoji assets remain publishable");
     let many_tags: Vec<Tag> = (0..513)
         .map(|n| Tag::parse(["imeta", &format!("url http://{host}/media/{n:064x}.bin")]).unwrap())
         .collect();
@@ -823,7 +957,7 @@ async fn private_media_revocation_http_journey() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &large_set)
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &bounded_set)
         .await
         .expect("shadow accepts database lookup failures");
     let upload = Request::builder()
@@ -852,11 +986,11 @@ async fn private_media_revocation_http_journey() {
         .execute(state.db.pool())
         .await
         .unwrap();
-    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &large_set)
+    crate::handlers::media_access::validate_media_references(&tenant, &shadow, &bounded_set)
         .await
         .expect("shadow accepts publication recording failure");
     assert!(
-        crate::handlers::media_access::validate_media_references(&tenant, &state, &large_set)
+        crate::handlers::media_access::validate_media_references(&tenant, &state, &bounded_set)
             .await
             .is_err(),
         "enforce rejects recording failure"

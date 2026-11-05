@@ -202,6 +202,34 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
         MediaAccess::Restricted,
         "superseded avatar grants nothing"
     );
+    // Accepted image-only and animated profiles remain readable after publishing.
+    // Fully escaped animation hashes exercise the descriptor candidate fallback.
+    let encoded = url::form_urlencoded::byte_serialize(format!("{base}/{a}.bin").as_bytes())
+        .collect::<String>()
+        .replace('a', "%61");
+    for content in [
+        serde_json::json!({"image":format!("{base}/{a}.bin")}),
+        serde_json::json!({"picture":format!("https://foreign/poster.png#buzz-anim={encoded}")}),
+    ] {
+        let current = EventBuilder::new(Kind::Metadata, content.to_string())
+            .sign_with_keys(&owner)
+            .unwrap();
+        db.insert_event(community, &current, None).await.unwrap();
+        assert_eq!(
+            allowed(&db, community, &a, &base, &outsider).await,
+            MediaAccess::Allowed
+        );
+        sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(current.id.as_bytes().as_slice())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            allowed(&db, community, &a, &base, &owner).await,
+            MediaAccess::Restricted
+        );
+    }
     // A tenant never borrows another tenant's proof or publication.
     let other = db
         .ensure_configured_community(&format!("other-{}.example", uuid::Uuid::new_v4()))
