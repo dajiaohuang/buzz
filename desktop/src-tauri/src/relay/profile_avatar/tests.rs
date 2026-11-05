@@ -627,6 +627,32 @@ async fn creation_transfers_only_chosen_bytes_from_owner_to_agent() {
             );
             assert!(requests.iter().all(|(_, event)| event.pubkey == signer));
         }
+        let uploads: std::collections::BTreeSet<String> = data
+            .requests
+            .iter()
+            .filter(|(method, _)| method == "upload")
+            .map(|(_, event)| {
+                event
+                    .tags
+                    .iter()
+                    .find(|tag| tag.as_slice().first().map(String::as_str) == Some("x"))
+                    .unwrap()
+                    .as_slice()[1]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            uploads,
+            std::collections::BTreeSet::from([
+                media_hash(&url::Url::parse(&poster).unwrap())
+                    .unwrap()
+                    .to_owned(),
+                media_hash(&url::Url::parse(&animation).unwrap())
+                    .unwrap()
+                    .to_owned(),
+            ]),
+            "agent possession must cover both distinct avatar assets"
+        );
         assert_eq!(data.profiles.last().unwrap().pubkey, agent.public_key());
     }
     // Arbitrary external URLs never receive the owner's credentials.
