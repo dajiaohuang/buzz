@@ -15,7 +15,7 @@ pub(crate) async fn validate_media_references(
     }
     let base = crate::api::media::media_base_url_for_tenant(&state.config.relay_url, tenant.host());
     let hashes = buzz_core::media::publication_hashes(event, &base);
-    if hashes.len() > 512 && !matches!(event.kind.as_u16(), 10030 | 30030) {
+    if hashes.len() > 512 {
         metrics::counter!("buzz_media_publication_access_total", "mode" => mode.label(), "reason" => "limit").increment(1);
         return if mode == MediaReadMode::Enforce {
             Err(IngestError::Rejected(
