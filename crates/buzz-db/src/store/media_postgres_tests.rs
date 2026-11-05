@@ -365,10 +365,34 @@ async fn media_reference_full_query_plans() {
     sqlx::raw_sql(fixture).execute(&mut *tx).await.unwrap();
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE INDEX idx_events_media_edit_target ON media_access_plan.events (community_id,channel_id, ({}),created_at DESC,id DESC) WHERE kind=40003 AND deleted_at IS NULL", super::media::MEDIA_EDIT_TARGET_SQL)))
         .execute(&mut *tx).await.unwrap();
-    sqlx::query("SET LOCAL statement_timeout = '2s'")
+    sqlx::query("SET LOCAL jit = on")
         .execute(&mut *tx)
         .await
         .unwrap();
+    let jit_available: bool = sqlx::query_scalar("SELECT pg_jit_available()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::raw_sql(super::media::MEDIA_LOOKUP_SETTINGS_SQL)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let jit: String = sqlx::query_scalar("SHOW jit")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        jit, "off",
+        "the production transaction must not compile partitioned authorization probes"
+    );
+    println!(
+        "PostgreSQL: {}; JIT available: {}; authorization jit={jit}",
+        sqlx::query_scalar::<_, String>("SELECT version()")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap(),
+        jit_available
+    );
     let community = CommunityId::from_uuid(uuid::Uuid::from_u128(1));
     let hash = "a".repeat(64);
     let reader = [0x11; 32];
@@ -386,7 +410,7 @@ async fn media_reference_full_query_plans() {
             let mut statement = builder.build();
             let args = statement.take_arguments().unwrap().unwrap();
             let sql = format!(
-                "EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) {}",
+                "EXPLAIN (ANALYZE, BUFFERS, COSTS ON) {}",
                 statement.sql().as_str()
             );
             // Only the production QueryBuilder SQL is prefixed; all values stay bound.
@@ -408,6 +432,17 @@ async fn media_reference_full_query_plans() {
                     "edit-target index absent: {plan}"
                 );
             }
+            let execution_ms: f64 = plan
+                .lines()
+                .find_map(|line| line.strip_prefix("Execution Time: "))
+                .and_then(|value| value.strip_suffix(" ms"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                execution_ms < 1000.0,
+                "authorization probe must retain headroom under its 2s timeout: {plan}"
+            );
             for row in rows {
                 println!("{}", row.get::<String, _>(0));
             }
