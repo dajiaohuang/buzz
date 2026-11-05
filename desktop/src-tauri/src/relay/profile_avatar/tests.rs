@@ -557,7 +557,12 @@ async fn creation_transfers_only_chosen_bytes_from_owner_to_agent() {
     let state = state(&[&target]);
     let owner = Keys::generate();
     let agent = Keys::generate();
-    let avatar = seed(&target, image(3));
+    let poster = seed(&target, image(3));
+    let animation = seed(&target, image(5));
+    let avatar = format!(
+        "{poster}#buzz-anim={}",
+        percent_encoding::utf8_percent_encode(&animation, percent_encoding::NON_ALPHANUMERIC)
+    );
     let external = server().await;
     // A workspace switch after creation captured its target must not retarget
     // either the owner download or the agent's profile publication.
@@ -578,24 +583,19 @@ async fn creation_transfers_only_chosen_bytes_from_owner_to_agent() {
     );
     {
         let data = target.state.data.lock().unwrap();
-        assert_eq!(
-            data.requests
+        for (method, signer) in [("read", owner.public_key()), ("upload", agent.public_key())] {
+            let requests: Vec<_> = data
+                .requests
                 .iter()
-                .find(|(method, _)| method == "read")
-                .unwrap()
-                .1
-                .pubkey,
-            owner.public_key()
-        );
-        assert_eq!(
-            data.requests
-                .iter()
-                .find(|(method, _)| method == "upload")
-                .unwrap()
-                .1
-                .pubkey,
-            agent.public_key()
-        );
+                .filter(|(verb, _)| verb == method)
+                .collect();
+            assert_eq!(
+                requests.len(),
+                2,
+                "both animated avatar assets must transfer"
+            );
+            assert!(requests.iter().all(|(_, event)| event.pubkey == signer));
+        }
         assert_eq!(data.profiles.last().unwrap().pubkey, agent.public_key());
     }
     // Arbitrary external URLs never receive the owner's credentials.

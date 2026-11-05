@@ -42,6 +42,45 @@ pub fn local_hash(value: &str, base: &str) -> Option<String> {
     Some(hash.to_owned())
 }
 
+/// Decode the desktop's animated-avatar descriptor into its poster and animation.
+/// Each URL still needs its own tenant check. Malformed escapes never become URLs.
+pub fn animated_avatar_urls(value: &str) -> Option<(String, String)> {
+    let (poster, encoded) = value.split_once("#buzz-anim=")?;
+    if encoded.is_empty() {
+        return None;
+    }
+    let bytes = encoded.as_bytes();
+    for (i, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit())
+        {
+            return None;
+        }
+    }
+    let animation = percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    for candidate in [poster, animation.as_str()] {
+        let parsed = url::Url::parse(candidate).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            return None;
+        }
+    }
+    Some((poster.to_owned(), animation))
+}
+
+fn avatar_hashes(value: &str, base: &str, out: &mut BTreeSet<String>) {
+    if let Some((poster, animation)) = animated_avatar_urls(value) {
+        out.extend(local_hash(&poster, base));
+        out.extend(local_hash(&animation, base));
+    } else {
+        out.extend(local_hash(value, base));
+    }
+}
+
 /// Extract counted references. imeta URL/image fields cover attachments,
 /// previews and posters. Profile pictures/banners, group pictures and emoji
 /// are the explicitly supported non-message references. Free text grants nothing.
@@ -87,7 +126,7 @@ pub fn reference_hashes(event: &Event, base: &str) -> BTreeSet<String> {
             .flatten()
             {
                 if let Some(value) = value.as_str() {
-                    out.extend(local_hash(value, base));
+                    avatar_hashes(value, base, &mut out);
                 }
             }
         }
@@ -102,7 +141,7 @@ pub fn publication_hashes(event: &Event, base: &str) -> BTreeSet<String> {
     fn visit(value: &serde_json::Value, base: &str, out: &mut BTreeSet<String>) {
         match value {
             serde_json::Value::String(value) => {
-                out.extend(local_hash(value, base));
+                avatar_hashes(value, base, out);
             }
             serde_json::Value::Array(values) => {
                 for value in values {
@@ -164,6 +203,52 @@ mod tests {
             format!("/media/{hash}.png?x=1"),
         ] {
             assert_eq!(local_hash(&value, "https://local/media"), None);
+        }
+    }
+    #[test]
+    fn animated_profiles_check_each_url_and_reject_malformed_descriptors() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        for (poster, animation, expected) in [
+            (
+                format!("https://local/media/{a}.png"),
+                format!("https://local/media/{b}.png"),
+                BTreeSet::from([a.clone(), b.clone()]),
+            ),
+            (
+                format!("https://foreign/media/{a}.png"),
+                format!("https://local/media/{b}.png"),
+                BTreeSet::from([b]),
+            ),
+            (
+                format!("https://local/media/{a}.png"),
+                format!("https://foreign/media/{}.png", "c".repeat(64)),
+                BTreeSet::from([a.clone()]),
+            ),
+        ] {
+            let descriptor = format!(
+                "{poster}#buzz-anim={}",
+                percent_encoding::utf8_percent_encode(
+                    &animation,
+                    percent_encoding::NON_ALPHANUMERIC
+                )
+            );
+            let event = EventBuilder::new(
+                Kind::Metadata,
+                serde_json::json!({"picture":descriptor}).to_string(),
+            )
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+            assert_eq!(reference_hashes(&event, "https://local/media"), expected);
+            assert_eq!(publication_hashes(&event, "https://local/media"), expected);
+        }
+        for value in [
+            "https://local/a#buzz-anim=%xx",
+            "https://local/a#buzz-anim=%ff",
+            "https://local/a#buzz-anim=",
+            "https://local/a#buzz-anim=javascript:foo",
+        ] {
+            assert!(animated_avatar_urls(value).is_none(), "{value}");
         }
     }
     #[test]

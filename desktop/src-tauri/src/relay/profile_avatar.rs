@@ -63,6 +63,28 @@ pub(crate) async fn localize_avatar(
     avatar: Option<&str>,
     auth_tag: Option<&str>,
 ) -> Result<Option<String>, String> {
+    if let Some((poster, animation)) = avatar.and_then(buzz_core_pkg::media::animated_avatar_urls) {
+        let poster = localize_avatar_url(state, relay, keys, Some(&poster), auth_tag)
+            .await?
+            .ok_or("missing avatar poster")?;
+        let animation = localize_avatar_url(state, relay, keys, Some(&animation), auth_tag)
+            .await?
+            .ok_or("missing avatar animation")?;
+        return Ok(Some(format!(
+            "{poster}#buzz-anim={}",
+            percent_encoding::utf8_percent_encode(&animation, percent_encoding::NON_ALPHANUMERIC)
+        )));
+    }
+    localize_avatar_url(state, relay, keys, avatar, auth_tag).await
+}
+
+async fn localize_avatar_url(
+    state: &AppState,
+    relay: &str,
+    keys: &Keys,
+    avatar: Option<&str>,
+    auth_tag: Option<&str>,
+) -> Result<Option<String>, String> {
     let Some(avatar) = avatar else {
         return Ok(None);
     };
@@ -165,6 +187,22 @@ pub(crate) async fn localize_avatar(
 /// fetched as the creating owner; actual bytes are then uploaded as the new
 /// agent. Reconciliation never inherits this owner capability.
 pub(crate) async fn transfer_created_avatar(
+    state: &AppState,
+    relay: &str,
+    owner: &Keys,
+    agent: &Keys,
+    avatar: Option<&str>,
+    auth_tag: Option<&str>,
+) -> Result<(), String> {
+    if let Some((poster, animation)) = avatar.and_then(buzz_core_pkg::media::animated_avatar_urls) {
+        transfer_created_avatar_url(state, relay, owner, agent, Some(&poster), auth_tag).await?;
+        transfer_created_avatar_url(state, relay, owner, agent, Some(&animation), auth_tag).await
+    } else {
+        transfer_created_avatar_url(state, relay, owner, agent, avatar, auth_tag).await
+    }
+}
+
+async fn transfer_created_avatar_url(
     state: &AppState,
     relay: &str,
     owner: &Keys,
@@ -299,15 +337,21 @@ async fn existing_projection(
     }
     let profile: serde_json::Value =
         serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
-    let Some(picture) = profile["picture"]
-        .as_str()
-        .and_then(|p| url::Url::parse(p).ok())
-    else {
+    let Some(picture) = profile["picture"].as_str() else {
         return Ok(None);
     };
-    Ok((picture.origin() == target.origin()
-        && media_hash(&picture).ok() == Some(media_hash(source)?))
-    .then(|| picture.into()))
+    let candidates = match buzz_core_pkg::media::animated_avatar_urls(picture) {
+        Some((poster, animation)) => vec![poster, animation],
+        None => vec![picture.to_owned()],
+    };
+    let source_hash = media_hash(source)?;
+    Ok(candidates
+        .into_iter()
+        .filter_map(|value| url::Url::parse(&value).ok())
+        .find(|picture| {
+            picture.origin() == target.origin() && media_hash(picture).ok() == Some(source_hash)
+        })
+        .map(Into::into))
 }
 
 async fn read_bounded(response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
