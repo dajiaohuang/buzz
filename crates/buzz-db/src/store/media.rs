@@ -266,9 +266,7 @@ pub(super) fn media_reference_query(
         query
             .push(" AND e.kind=0 AND e.deleted_at IS NULL AND (strpos(e.content, ")
             .push_bind(sha256)
-            .push(
-                ") > 0 OR strpos(e.content, '#buzz-anim=') > 0 OR strpos(e.content, E'\\\\u') > 0)",
-            );
+            .push(") > 0 OR strpos(e.content, E'\\\\u') > 0)");
     } else {
         query.push(" AND (");
         let selected = if probe == 0 {

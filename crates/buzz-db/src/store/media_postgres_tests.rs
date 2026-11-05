@@ -202,15 +202,21 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
         MediaAccess::Restricted,
         "superseded avatar grants nothing"
     );
-    // Accepted image-only and animated profiles remain readable after publishing.
-    // Fully escaped animation hashes exercise the descriptor candidate fallback.
+    // Image-only profiles remain readable. Over-encoded animation hashes do not
+    // widen profile candidates beyond hash/JSON-escape matches.
     let encoded = format!("{base}/{a}.bin")
         .replace(':', "%3A")
         .replace('/', "%2F")
         .replace('a', "%61");
-    for content in [
-        serde_json::json!({"image":format!("{base}/{a}.bin")}),
-        serde_json::json!({"picture":format!("https://foreign/poster.png#buzz-anim={encoded}")}),
+    for (content, expected) in [
+        (
+            serde_json::json!({"image":format!("{base}/{a}.bin")}),
+            MediaAccess::Allowed,
+        ),
+        (
+            serde_json::json!({"picture":format!("https://foreign/poster.png#buzz-anim={encoded}")}),
+            MediaAccess::Restricted,
+        ),
     ] {
         let current = EventBuilder::new(Kind::Metadata, content.to_string())
             .sign_with_keys(&owner)
@@ -218,7 +224,7 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
         db.insert_event(community, &current, None).await.unwrap();
         assert_eq!(
             allowed(&db, community, &a, &base, &outsider).await,
-            MediaAccess::Allowed
+            expected
         );
         sqlx::query("UPDATE events SET deleted_at=now() WHERE community_id=$1 AND id=$2")
             .bind(community.as_uuid())
@@ -365,6 +371,43 @@ async fn popular_media_prefers_live_readable_references_and_bounds_work() {
         .await
         .expect("page-position decoys must not exhaust the image-reference budget"),
         MediaAccess::Allowed
+    );
+    // More than a full budget of unrelated, ordinary animated profiles must
+    // not turn a private denial or an absent hash into authorization-unavailable.
+    let poster = "2".repeat(64);
+    let animation = format!("{base}/{}.png", "3".repeat(64))
+        .replace(':', "%3A")
+        .replace('/', "%2F");
+    let profile_content =
+        serde_json::json!({"picture":format!("{base}/{poster}.png#buzz-anim={animation}")})
+            .to_string();
+    let profiles: Vec<_> = (0..1100)
+        .map(|_| {
+            let event = EventBuilder::new(Kind::Metadata, &profile_content)
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            serde_json::to_value(event).unwrap()
+        })
+        .collect();
+    sqlx::query("INSERT INTO events(community_id,id,pubkey,created_at,kind,tags,content,sig) SELECT $1,decode(p->>'id','hex'),decode(p->>'pubkey','hex'),to_timestamp((p->>'created_at')::bigint),0,p->'tags',p->>'content',decode(p->>'sig','hex') FROM jsonb_array_elements($2) p")
+        .bind(community.as_uuid()).bind(serde_json::Value::Array(profiles)).execute(db.pool()).await.unwrap();
+    assert_eq!(
+        db.media_access(
+            community,
+            &snapshot_hash,
+            "png",
+            &base,
+            reader.public_key().as_bytes(),
+            false,
+            |_, _| true
+        )
+        .await
+        .expect("unrelated animated profiles must preserve private denial"),
+        MediaAccess::Restricted
+    );
+    assert_eq!(
+        allowed(&db, community, &"1".repeat(64), &base, &reader).await,
+        MediaAccess::NoReference
     );
     // An oversized readable row must fail closed without buffering all candidates.
     let huge_hash = "e".repeat(64);

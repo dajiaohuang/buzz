@@ -25,7 +25,9 @@ Counted references are imeta `url` and `image` fields, link-preview snapshot ima
 `picture` is absent) and `banner` fields, group metadata `picture` tags, and emoji tags on emoji lists
 and sets. Root-relative paths and the tenant's HTTP/HTTPS media bases count.
 Animated profile descriptors count their poster and decoded animation URL
-independently, with the same tenant check on each. A pasted URL in free text alone grants nothing; messages must publish imeta.
+independently, with the same tenant check on each. The indexed profile lookup
+expects hash characters to remain literal, as in the desktop descriptor.
+Republish over-encoded hashes such as `%61` using canonical URLs. A pasted URL in free text alone grants nothing; messages must publish imeta.
 Deleted events/channels grant nothing. Only the newest live edit supplies a
 message's attachments; its original must remain live. Superseded profiles
 are excluded. Current community icons grant community-wide access.
