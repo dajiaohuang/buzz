@@ -204,8 +204,9 @@ async fn edits_deletion_legacy_profiles_and_publication_boundaries() {
     );
     // Accepted image-only and animated profiles remain readable after publishing.
     // Fully escaped animation hashes exercise the descriptor candidate fallback.
-    let encoded = url::form_urlencoded::byte_serialize(format!("{base}/{a}.bin").as_bytes())
-        .collect::<String>()
+    let encoded = format!("{base}/{a}.bin")
+        .replace(':', "%3A")
+        .replace('/', "%2F")
         .replace('a', "%61");
     for content in [
         serde_json::json!({"image":format!("{base}/{a}.bin")}),

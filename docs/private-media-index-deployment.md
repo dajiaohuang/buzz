@@ -24,13 +24,14 @@ the PostgreSQL regression creates a future partition and verifies attachment.
 Keep partition management paused while running the prebuild; if a new partition
 appears before verification, rerun the idempotent script and verify again.
 
-A failed concurrent child build leaves an invalid index. Identify only that
-unattached child index in `pg_index` whose definition matches the parent, drop it with `DROP INDEX CONCURRENTLY`
-outside a transaction, and rerun. A rerun skips only valid, ready, live matching
-indexes, so an invalid leftover does not prevent a fresh concurrent build;
-remove the unused invalid index afterward to avoid catalog clutter. Do not drop valid attached indexes or replace
-concurrent builds with a blocking build. Wrong definitions fail attachment or
-migration verification and need operator correction before proceeding.
+A failed concurrent child build leaves an invalid index. Rerunning skips only
+valid, ready, live matching indexes, so an invalid leftover does not prevent a
+fresh concurrent build. After successful attachment, identify only the unused,
+unattached invalid child whose definition matches the parent and drop it with
+`DROP INDEX CONCURRENTLY` outside a transaction. Do not drop valid attached
+indexes or replace concurrent builds with a blocking build. Wrong definitions
+fail attachment or migration verification and need operator correction before
+proceeding.
 
 Migration 0085 builds directly only on an empty events table. Populated databases
 without the prebuilt index fail startup with an explicit prebuild instruction.
