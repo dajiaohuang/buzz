@@ -9,6 +9,12 @@ use sqlx::{Postgres, QueryBuilder, Row};
 // Keep DDL/catalog and Rust target parity covered by the PostgreSQL tests.
 pub(crate) const MEDIA_EDIT_TARGET_SQL: &str = r#"decode(lower(jsonb_path_query_first(tags, 'strict $[*] ? (@[0] == "e" && @[1] like_regex "^[0-9A-Fa-f]{64}$")[1]', '{}'::jsonb, true) #>> '{}'), 'hex')"#;
 
+// Short indexed authorization probes cannot amortize LLVM compilation.
+// Partitioned permission plans can compile for seconds before reading any row.
+// Ordinary database work retains its configured JIT policy.
+pub(super) const MEDIA_LOOKUP_SETTINGS_SQL: &str =
+    "SET LOCAL statement_timeout = '2s'; SET LOCAL jit = off";
+
 fn edit_target(alias: &str) -> String {
     MEDIA_EDIT_TARGET_SQL.replacen("(tags,", &format!("({alias}.tags,"), 1)
 }
@@ -100,7 +106,7 @@ impl Db {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("SET LOCAL statement_timeout = '2s'")
+        sqlx::raw_sql(MEDIA_LOOKUP_SETTINGS_SQL)
             .execute(&mut *tx)
             .await?;
         let uploaded: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM media_uploaders WHERE community_id=$1 AND sha256=$2 AND pubkey=$3)")
