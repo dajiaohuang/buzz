@@ -1094,6 +1094,7 @@ pub(crate) async fn serve_blob_for_tenant(
                     if start >= total {
                         return axum::response::Response::builder()
                             .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                            .header(header::CACHE_CONTROL, cache_control)
                             .header(header::CONTENT_RANGE, format!("bytes */{total}"))
                             .body(axum::body::Body::empty())
                             .map_err(|_| MediaError::Internal);
@@ -1121,6 +1122,7 @@ pub(crate) async fn serve_blob_for_tenant(
                 }
                 None => Ok(axum::response::Response::builder()
                     .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CACHE_CONTROL, cache_control)
                     .header(header::CONTENT_RANGE, format!("bytes */{total}"))
                     .body(axum::body::Body::empty())
                     .map_err(|_| MediaError::Internal)?),

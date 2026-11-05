@@ -21,17 +21,20 @@ channel membership. Ordinary REQ event visibility, recipient-gated kinds and
 encrypted engrams retain their restrictions. Gift-wrap ciphertext itself
 cannot supply hidden attachment references.
 
-Counted references are imeta `url` and `image` fields, profile `picture` and
-`banner` fields, group metadata `picture` tags, and emoji tags on emoji lists
+Counted references are imeta `url` and `image` fields, link-preview snapshot image/favicon fields, profile `picture` (or `image` when
+`picture` is absent) and `banner` fields, group metadata `picture` tags, and emoji tags on emoji lists
 and sets. Root-relative paths and the tenant's HTTP/HTTPS media bases count.
-A pasted URL in free text alone grants nothing; messages must publish imeta.
+Animated profile descriptors count their poster and decoded animation URL
+independently, with the same tenant check on each. A pasted URL in free text alone grants nothing; messages must publish imeta.
 Deleted events/channels grant nothing. Only the newest live edit supplies a
 message's attachments; its original must remain live. Superseded profiles
 are excluded. Current community icons grant community-wide access.
 
 The read path probes the existing tags GIN index for imeta hashes and exact
 local URL aliases. It scans content only for current kind-0 profiles in the
-community, never all message bodies. A two-second statement deadline and a
+community, never all message bodies. LLVM/JIT is disabled only in this short authorization transaction: compiling
+partitioned permission probes costs seconds without amortizing that cost.
+Other database work retains its configured JIT policy. A two-second statement deadline and a
 1,024-candidate budget per probe and a 16 MiB aggregate work budget bound each lookup. An accessible candidate can succeed
 before an overflow refusal. Candidates stream one at a time rather than allocating an entire page of message bodies. Budget exhaustion or a database failure returns
 503; an inaccessible/missing reference returns 404. NIP-FI strict mode keeps
@@ -85,11 +88,17 @@ that points to the same bytes as a private attachment. Custom historical media
 hosts beyond the tenant's current authority require explicit repair.
 
 Roll back policy by restarting with `off`; retain the additive schema and
-publication markers. Mixed off/enforce serving pods cannot provide revocation.
+publication markers. If rolling back to a pre-0084 binary, keep auto-migration
+disabled and suspend community deletion: its exact-set deletion catalog does
+not recognize the two added media tables, so deletion fails closed. Resume
+deletion after deploying a binary whose deletion catalog includes them. Mixed off/enforce serving pods cannot provide revocation.
 Shadow/off do not close the original exposure. Shadow lookup failures are
 counted without refusing reads; enforcement fails closed.
 
-Successful media responses and media denials use `private, no-store`. New
+Successful media responses, authorized range errors and media denials use
+`private, no-store` in all modes, including off. Off preserves the previous
+authorization behavior; cache headers intentionally change before enforce to
+avoid creating more year-long immutable entries during the preparatory rollout. New
 responses therefore increase repeat-download bandwidth. The desktop proxy
 passes this policy to the WebView; its local file cache and the mobile client's
 local copies can still display previously fetched bytes. Old immutable HTTP
@@ -105,10 +114,20 @@ Media authorization uses a shared semaphore across database-handle clones,
 limited to one quarter of the writer pool, capped at eight lookups. Saturation
 waits up to 500 ms before returning authorization-unavailable, counted with
 `reason="capacity"`, before pool acquisition. Every Range
-request reauthorizes; ordinary events have a 512-reference cap, emoji list/set kinds are exempt, and checks run
+request reauthorizes; all events, including emoji lists and sets, have a 512-reference cap, and checks run
 sequentially within that connection bound. Missing sidecars reject publication
 in enforce mode; shadow counts failures and accepts the write, including stale
 avatar metadata edits and upload-proof/publication-marker errors.
+
+Eight slots provide an upper bound of `8 / mean_lookup_seconds` lookups per
+second per pod before queueing (for example, 20 ms means about 400/s; 100 ms
+means about 80/s). A smaller writer pool reduces that bound proportionally.
+These are capacity calculations, not measured throughput targets. Measure full
+request latency and concurrent image/avatar bursts, including all probes,
+sidecars and pool acquisition. Keep sustained traffic below the measured bound;
+the 500 ms queue absorbs bursts but cannot increase throughput. Each lookup
+uses a writer connection and several statements; no-store repeats that work on
+every view. The synthetic query-plan times exclude storage/network/pool costs.
 
 During staging soak, abort enforcement if writer authorization acquire p95
 exceeds 50 ms for five minutes, event-write acquire p95 doubles its pre-rollout
@@ -117,6 +136,12 @@ five minutes. Investigate query latency, pool utilization and storage errors
 before retrying. Shadow failures must be repaired before enforce, since a failed
 recording does not establish possession. Uploads made in off mode record no
 proof: uploads not yet posted when enforce starts require reuploading.
+
+Before enforce, every client that uploads avatars with one key and publishes
+profiles with another must transfer the actual poster/animation bytes to an
+upload signed by the profile key. Owner relationships never inherit possession.
+Validate this in each supported client during shadow; upgrading only this
+repository's desktop does not migrate other clients.
 
 New managed-agent creation explicitly downloads the chosen target-local avatar
 with the captured owner's signer, verifies its image bytes and hash, then uploads

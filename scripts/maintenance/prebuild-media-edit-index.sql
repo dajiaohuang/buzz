@@ -17,6 +17,7 @@ WHERE h.inhparent='public.events'::regclass
  AND NOT EXISTS (SELECT 1 FROM pg_inherits ix JOIN pg_index i ON i.indexrelid=ix.inhrelid
  WHERE ix.inhparent='public.idx_events_media_edit_target'::regclass AND i.indrelid=c.oid)
  AND NOT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid=c.oid
+   AND i.indisvalid AND i.indisready AND i.indislive
    AND substring(pg_get_indexdef(i.indexrelid) FROM ' USING .*') =
        substring(pg_get_indexdef('public.idx_events_media_edit_target'::regclass) FROM ' USING .*'))
 ORDER BY c.oid

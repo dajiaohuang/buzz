@@ -26,7 +26,9 @@ appears before verification, rerun the idempotent script and verify again.
 
 A failed concurrent child build leaves an invalid index. Identify only that
 unattached child index in `pg_index` whose definition matches the parent, drop it with `DROP INDEX CONCURRENTLY`
-outside a transaction, and rerun. Do not drop valid attached indexes or replace
+outside a transaction, and rerun. A rerun skips only valid, ready, live matching
+indexes, so an invalid leftover does not prevent a fresh concurrent build;
+remove the unused invalid index afterward to avoid catalog clutter. Do not drop valid attached indexes or replace
 concurrent builds with a blocking build. Wrong definitions fail attachment or
 migration verification and need operator correction before proceeding.
 
