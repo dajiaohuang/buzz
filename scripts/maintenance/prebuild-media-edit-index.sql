@@ -8,6 +8,16 @@ SELECT $ddl$CREATE INDEX idx_events_media_edit_target ON ONLY public.events
  WHERE kind=40003 AND deleted_at IS NULL$ddl$
 WHERE to_regclass('public.idx_events_media_edit_target') IS NULL
 \gexec
+-- A failed generated child keeps its name. Remove only unusable, unattached,
+-- definition-matching builds so retries reuse desired-state child names.
+SELECT format('DROP INDEX CONCURRENTLY %s', i.indexrelid::regclass)
+FROM pg_index i JOIN pg_inherits h ON h.inhrelid=i.indrelid
+WHERE h.inhparent='public.events'::regclass AND NOT i.indisvalid AND NOT i.indisunique
+ AND NOT EXISTS (SELECT 1 FROM pg_inherits attached WHERE attached.inhrelid=i.indexrelid)
+ AND substring(pg_get_indexdef(i.indexrelid) FROM ' USING .*') =
+     substring(pg_get_indexdef('public.idx_events_media_edit_target'::regclass) FROM ' USING .*')
+ORDER BY i.indexrelid
+\gexec
 SELECT format($ddl$CREATE INDEX CONCURRENTLY ON %s
  (community_id,channel_id, (decode(lower(jsonb_path_query_first(tags, 'strict $[*] ? (@[0] == "e" && @[1] like_regex "^[0-9A-Fa-f]{64}$")[1]', '{}'::jsonb, true) #>> '{}'), 'hex')),created_at DESC,id DESC)
  WHERE kind=40003 AND deleted_at IS NULL$ddl$,
