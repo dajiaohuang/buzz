@@ -268,7 +268,10 @@ pub(super) fn media_reference_query(
         } else {
             &needles[1..]
         };
-        for (i, tag) in ["imeta", "picture", "emoji"].into_iter().enumerate() {
+        for (i, tag) in ["imeta", "picture", "emoji", "link-preview"]
+            .into_iter()
+            .enumerate()
+        {
             let matching: Vec<serde_json::Value> = selected
                 .iter()
                 .filter(|needle| needle[0][0].as_str() == Some(tag))
@@ -367,6 +370,7 @@ pub(super) fn media_reference_needles(
             for field in ["url", "image"] {
                 needles.push(serde_json::json!([["imeta", format!("{field} {url}")]]));
             }
+            needles.push(serde_json::json!([["link-preview", url]]));
             needles.push(serde_json::json!([["picture", url]]));
             needles.push(serde_json::json!([["emoji", url]]));
         }

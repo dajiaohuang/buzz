@@ -57,6 +57,13 @@ pub fn reference_hashes(event: &Event, base: &str) -> BTreeSet<String> {
                     }
                 }
             }
+            Some("link-preview")
+                if parts.len() == 11 && parts[1] == "snapshot" && parts[2] == "1" =>
+            {
+                for value in [&parts[7], &parts[9]] {
+                    out.extend(local_hash(value, base));
+                }
+            }
             Some("picture") if event.kind.as_u16() == 39000 => {
                 if let Some(value) = parts.get(1) {
                     out.extend(local_hash(value, base));
@@ -157,6 +164,43 @@ mod tests {
             format!("/media/{hash}.png?x=1"),
         ] {
             assert_eq!(local_hash(&value, "https://local/media"), None);
+        }
+    }
+    #[test]
+    fn snapshot_media_counts_only_image_and_favicon_urls() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let c = "c".repeat(64);
+        for (image, favicon, expected) in [
+            (
+                format!("/media/{a}.png"),
+                format!("https://local/media/{b}.png"),
+                BTreeSet::from([a.clone(), b.clone()]),
+            ),
+            (
+                format!("https://foreign/media/{a}.png"),
+                String::new(),
+                BTreeSet::new(),
+            ),
+        ] {
+            let event = EventBuilder::new(Kind::Custom(9), "")
+                .tags([Tag::parse([
+                    "link-preview",
+                    "snapshot",
+                    "1",
+                    &format!("https://local/media/{c}.png"),
+                    "title",
+                    "site",
+                    "description",
+                    &image,
+                    &a,
+                    &favicon,
+                    &b,
+                ])
+                .unwrap()])
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            assert_eq!(reference_hashes(&event, "https://local/media"), expected);
         }
     }
     #[test]
