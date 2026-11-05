@@ -72,8 +72,14 @@ pub fn reference_hashes(event: &Event, base: &str) -> BTreeSet<String> {
     }
     if event.kind.as_u16() == 0 {
         if let Ok(profile) = serde_json::from_str::<serde_json::Value>(&event.content) {
-            for field in ["picture", "banner"] {
-                if let Some(value) = profile.get(field).and_then(|v| v.as_str()) {
+            for value in [
+                profile.get("picture").or_else(|| profile.get("image")),
+                profile.get("banner"),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(value) = value.as_str() {
                     out.extend(local_hash(value, base));
                 }
             }
@@ -151,6 +157,30 @@ mod tests {
             format!("/media/{hash}.png?x=1"),
         ] {
             assert_eq!(local_hash(&value, "https://local/media"), None);
+        }
+    }
+    #[test]
+    fn profile_image_fallback_matches_materialization() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        for (content, expected) in [
+            (
+                serde_json::json!({"image":format!("/media/{a}.png")}),
+                BTreeSet::from([a.clone()]),
+            ),
+            (
+                serde_json::json!({"picture":format!("/media/{b}.png"),"image":format!("/media/{a}.png")}),
+                BTreeSet::from([b]),
+            ),
+            (
+                serde_json::json!({"picture":null,"image":format!("/media/{a}.png")}),
+                BTreeSet::new(),
+            ),
+        ] {
+            let event = EventBuilder::new(Kind::Metadata, content.to_string())
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            assert_eq!(reference_hashes(&event, "https://local/media"), expected);
         }
     }
     #[test]
